@@ -1,8 +1,8 @@
 # SpaceRescue User Guide
 
-> **Status (Oct 2026):** the screenshots show the new interface (`SpaceRescue.exe /preview`), which is waiting for design
-> approval. Until it's wired up, the review lists, actions and undo described in §3 run in the classic interface
-> (`SpaceRescue.exe`: Insights > Review…).
+> `SpaceRescue.exe` opens the interface shown here. Everything is clickable: drive chip (switch drive/folder), search
+> (Ctrl+K), review lists with actions and Undo, System tools, Settings. The original interface is still available with
+> `SpaceRescue.exe /classic`.
 
 ## 1. Install or run portable
 - **Installer:** run `SpaceRescue-Setup-x64.exe`. It installs for your account only (no admin) into

@@ -95,87 +95,135 @@ bool Scanner::ScanMft()
     tree.ReserveNodes(static_cast<u32>(records) - 1); // node 0 (root) already exists
     std::vector<u64> parentOf(records, ~0ull);
     std::vector<unsigned char> keep(records, 0);       // 1 = in-use base record with a usable name
-    ScanTree::NameCursor& cursor = tree.m_mainCursor;
 
-    constexpr u64 Chunk = 4 * MiB;
-    std::vector<BYTE> buffer(Chunk);
-    u64 recordIndex = 0;
-    u64 bytesSeen = 0;
-    for (const Run& run : runs)
+    // Split the MFT into <= 4 MB read jobs that each know their first record number.
+    struct Job { u64 offset; DWORD bytes; u64 firstRecord; };
+    std::vector<Job> jobs;
     {
-        u64 runBytes = run.clusters * cluster;
-        u64 offset = run.lcn * cluster;
-        while (runBytes && recordIndex < records && !m_cancel)
+        constexpr u64 Chunk = 4 * MiB;
+        u64 rec = 0;
+        for (const Run& run : runs)
         {
-            const DWORD want = static_cast<DWORD>(std::min<u64>(Chunk, runBytes));
-            OVERLAPPED ov = {};
-            ov.Offset = static_cast<DWORD>(offset);
-            ov.OffsetHigh = static_cast<DWORD>(offset >> 32);
-            DWORD read = 0;
-            if (!ReadFile(vol.h, buffer.data(), want, &read, &ov) || read == 0) return false;
-            for (u32 pos = 0; pos + recordSize <= read && recordIndex < records; pos += recordSize, ++recordIndex)
+            u64 runBytes = run.clusters * cluster, offset = run.lcn * cluster;
+            while (runBytes && rec < records)
             {
-                BYTE* rec = buffer.data() + pos;
-                if (!Fixup(rec, recordSize)) continue;
-                const u16 flags = Read<u16>(rec, 0x16);
-                if (!(flags & RecordInUse)) continue;
-                const u64 base = Read<u64>(rec, 0x20) & 0x0000FFFFFFFFFFFFull;
-                const u64 target = base ? base : recordIndex;
-                if (target >= records) continue;
-                Node& node = tree.At(NodeOf(target));
-                if (!base && (flags & RecordIsDirectory)) node.flags |= NF_DIR;
-
-                for (u32 a = Read<u16>(rec, 0x14); a + 16 <= recordSize;)
-                {
-                    const u32 type = Read<u32>(rec, a);
-                    const u32 len = Read<u32>(rec, a + 4);
-                    if (type == AttrEnd || len < 16 || a + len > recordSize) break;
-                    const bool nonResident = rec[a + 8] != 0;
-                    const u8 nameLen = rec[a + 9];
-                    const u16 attrFlags = Read<u16>(rec, a + 0x0C);
-                    if (!nonResident && (type == AttrStandardInfo || type == AttrFileName))
-                    {
-                        const BYTE* v = rec + a + Read<u16>(rec, a + 0x14);
-                        if (type == AttrStandardInfo)
-                        {
-                            node.writeTime = Read<u64>(v, 0x08);
-                            node.accessTime = Read<u64>(v, 0x18);
-                            node.attributes = Read<u32>(v, 0x20);
-                        }
-                        else if (v[0x41] != NamespaceDos && node.nameLen == 0)
-                        {
-                            const u8 chars = v[0x40];
-                            std::wstring name(reinterpret_cast<const wchar_t*>(v + 0x42), chars);
-                            tree.SetName(node, cursor, name.c_str(), name.size());
-                            parentOf[target] = Read<u64>(v, 0) & 0x0000FFFFFFFFFFFFull;
-                            keep[target] = 1;
-                        }
-                    }
-                    else if (type == AttrData && nameLen == 0) // unnamed $DATA = file contents
-                    {
-                        if (!nonResident)
-                        {
-                            node.size = Read<u32>(rec, a + 0x10);
-                            node.alloc = 0; // stored inside the MFT record (resident)
-                        }
-                        else if (Read<u64>(rec, a + 0x10) == 0) // first piece holds the sizes
-                        {
-                            node.size = Read<u64>(rec, a + 0x30);
-                            node.alloc = (attrFlags & (AttrFlagCompressed | AttrFlagSparse)) && len >= 0x48 ?
-                                Read<u64>(rec, a + 0x40) : Read<u64>(rec, a + 0x28);
-                        }
-                    }
-                    else if (type == AttrReparse) node.flags |= NF_REPARSE;
-                    a += len;
-                }
+                u64 want = std::min<u64>({ Chunk, runBytes, (records - rec) * recordSize });
+                want = std::min<u64>(runBytes, (want + cluster - 1) / cluster * cluster); // unbuffered reads: whole clusters
+                jobs.push_back({ offset, static_cast<DWORD>(want), rec });
+                rec += want / recordSize;
+                offset += want;
+                runBytes -= want;
             }
-            bytesSeen += read;
-            offset += read;
-            runBytes -= read;
-            m_bytes.store(bytesSeen, std::memory_order_relaxed);
         }
     }
-    if (m_cancel) return false;
+
+    // Parses one record into its node. Extension records (base != 0) describe another file's node, so in
+    // the parallel pass they are copied to `deferred` and applied afterwards on one thread.
+    using Deferred = std::vector<std::pair<u64, std::vector<BYTE>>>;
+    auto parse = [&](BYTE* rec, u64 recordIndex, ScanTree::NameCursor& cursor, Deferred* deferred, bool fixedUp)
+    {
+        if (!fixedUp && !Fixup(rec, recordSize)) return;
+        const u16 flags = Read<u16>(rec, 0x16);
+        if (!(flags & RecordInUse)) return;
+        const u64 base = Read<u64>(rec, 0x20) & 0x0000FFFFFFFFFFFFull;
+        if (base && deferred)
+        {
+            deferred->emplace_back(recordIndex, std::vector<BYTE>(rec, rec + recordSize));
+            return;
+        }
+        const u64 target = base ? base : recordIndex;
+        if (target >= records) return;
+        Node& node = tree.At(NodeOf(target));
+        if (!base && (flags & RecordIsDirectory)) node.flags |= NF_DIR;
+
+        for (u32 a = Read<u16>(rec, 0x14); a + 16 <= recordSize;)
+        {
+            const u32 type = Read<u32>(rec, a);
+            const u32 len = Read<u32>(rec, a + 4);
+            if (type == AttrEnd || len < 16 || a + len > recordSize) break;
+            const bool nonResident = rec[a + 8] != 0;
+            const u8 nameLen = rec[a + 9];
+            const u16 attrFlags = Read<u16>(rec, a + 0x0C);
+            if (!nonResident && (type == AttrStandardInfo || type == AttrFileName))
+            {
+                const BYTE* v = rec + a + Read<u16>(rec, a + 0x14);
+                if (type == AttrStandardInfo)
+                {
+                    node.writeTime = Read<u64>(v, 0x08);
+                    node.accessTime = Read<u64>(v, 0x18);
+                    node.attributes = Read<u32>(v, 0x20);
+                }
+                else if (v[0x41] != NamespaceDos && node.nameLen == 0)
+                {
+                    tree.SetName(node, cursor, reinterpret_cast<const wchar_t*>(v + 0x42), v[0x40]);
+                    parentOf[target] = Read<u64>(v, 0) & 0x0000FFFFFFFFFFFFull;
+                    keep[target] = 1;
+                }
+            }
+            else if (type == AttrData && nameLen == 0) // unnamed $DATA = file contents
+            {
+                if (!nonResident)
+                {
+                    node.size = Read<u32>(rec, a + 0x10);
+                    node.alloc = 0; // stored inside the MFT record (resident)
+                }
+                else if (Read<u64>(rec, a + 0x10) == 0) // first piece holds the sizes
+                {
+                    node.size = Read<u64>(rec, a + 0x30);
+                    node.alloc = (attrFlags & (AttrFlagCompressed | AttrFlagSparse)) && len >= 0x48 ?
+                        Read<u64>(rec, a + 0x40) : Read<u64>(rec, a + 0x28);
+                }
+            }
+            else if (type == AttrReparse) node.flags |= NF_REPARSE;
+            a += len;
+        }
+    };
+
+    // Parallel pass: each worker reads its own chunk (unbuffered, overlapped -> deep NVMe queue) and parses it.
+    Handle async(CreateFileW(volume.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr));
+    if (!async.valid()) return false;
+    std::atomic<size_t> nextJob{ 0 };
+    std::atomic<bool> failed{ false };
+    std::mutex deferredLock;
+    Deferred deferred;
+    const int workers = static_cast<int>(std::clamp(std::thread::hardware_concurrency(), 2u, 8u));
+    std::vector<std::thread> pool;
+    for (int w = 0; w < workers; ++w)
+        pool.emplace_back([&] {
+            BYTE* buffer = static_cast<BYTE*>(VirtualAlloc(nullptr, 4 * MiB, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+            HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            ScanTree::NameCursor cursor;
+            Deferred local;
+            while (buffer && done && !m_cancel && !failed)
+            {
+                const size_t j = nextJob.fetch_add(1);
+                if (j >= jobs.size()) break;
+                OVERLAPPED ov = {};
+                ov.Offset = static_cast<DWORD>(jobs[j].offset);
+                ov.OffsetHigh = static_cast<DWORD>(jobs[j].offset >> 32);
+                ov.hEvent = done;
+                DWORD read = 0;
+                if ((!ReadFile(async.h, buffer, jobs[j].bytes, nullptr, &ov) && GetLastError() != ERROR_IO_PENDING) ||
+                    !GetOverlappedResult(async.h, &ov, &read, TRUE))
+                {
+                    failed = true;
+                    break;
+                }
+                u64 r = jobs[j].firstRecord;
+                for (u32 pos = 0; pos + recordSize <= read && r < records; pos += recordSize, ++r)
+                    parse(buffer + pos, r, cursor, &local, false);
+                m_bytes.fetch_add(read, std::memory_order_relaxed);
+            }
+            if (!buffer || !done) failed = true;
+            if (buffer) VirtualFree(buffer, 0, MEM_RELEASE);
+            if (done) CloseHandle(done);
+            std::lock_guard<std::mutex> guard(deferredLock);
+            for (auto& d : local) deferred.push_back(std::move(d));
+        });
+    for (std::thread& t : pool) t.join();
+    if (m_cancel || failed) return false;
+    for (auto& [index, bytes] : deferred) parse(bytes.data(), index, tree.m_mainCursor, nullptr, true);
 
     // Link children to parents; skip metafiles and anything whose parent is gone.
     Node& root = tree.At(0);
