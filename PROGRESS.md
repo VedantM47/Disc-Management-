@@ -28,6 +28,29 @@ Possible speed-up later: multi-threaded enumeration (upstream uses a work queue)
 - [x] `package.ps1` → `SpaceRescue-portable.zip` (653 KB), `SpaceRescue-Setup-x86.exe` (704 KB)
 - [x] Fix: Recycle uses FOF_WANTNUKEWARNING, so items too big for the bin are never silently destroyed
 
+## Revamp – Phase A: audit (2026-10-26)
+- [x] `STATUS_REPORT.md` complete (sections 1–8), screenshots in `docs/screens/` (dark only, captured off-screen)
+
+## Revamp – Phase B: toolchain
+- [x] llvm-mingw 20261020 (clang 23.1.4, x86_64, libc++) installed per-user via winget, no admin
+- [x] `build.ps1` → clang++ `-std=c++23`, x64, static, parallel jobs (one per core), `.d`-based incremental, `-Fast`/`-Release`/`-Clean`/`-Gcc`
+- [x] Clean build: 0 errors, 0 warnings. Full -O2 build 19.9 s, `-Fast` 6.6 s, one-file incremental **1.7 s**
+- [ ] Upstream spike (llvm-mingw + ATL shim, scratch copy): 293 → 24 unique error sites after qualifying `Route<&Handler>` member pointers (MSVC-only syntax). Remaining: 19 in-class route tables, generated `LangStrings.h`, a `Tracer.h` constexpr, 1 incomplete type. Link and runtime not attempted yet. **Decision pending**
+
+## Revamp – Phase C: fast scanner
+- [x] N workers (default min(cores, 8)) on a LIFO folder queue; `NtQueryDirectoryFile(FileFullDirectoryInformation)` with a 64 KiB per-thread buffer (faster than 1 MiB, measured); real `AllocationSize` from the FS (no per-file path strings or extra calls)
+- [x] Lock-free node reservation per folder (contiguous blocks), per-worker name cursors; ASCII names stored 1 byte/char
+- [x] Live per-top-level-folder sizes in `ScanProgress::topLevel` (for streaming UI)
+
+| Benchmark (warm cache, unelevated, x64) | Before | After |
+|---|---|---|
+| C:\ full (1.68M files, 402K folders) | 57.9 s (cold 289 s), 263 MB | **10.6 s, 258–261 MB** |
+| C:\Windows (349K files) | 21–25 s, 111 MB | **5.3 s**, 170 MB |
+| App: scan C:\Users\imved (1.2M files) | 38.7 s, 164 MB | **6.4 s, 139 MB** |
+
+- [ ] Cold-cache and MFT (elevated) timings: not run yet (needs a reboot or admin)
+- [ ] Quick-win pre-scan + streaming UI
+
 ## Not yet verified
 
 - [ ] Elevated run: MFT stats vs `fsutil fsinfo ntfsinfo`
