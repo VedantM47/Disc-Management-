@@ -1,5 +1,5 @@
 # SpaceRescue packaging - only tools that ship with Windows (IExpress, Compress-Archive).
-# Produces build\dist\SpaceRescue-Setup-x86.exe and build\dist\SpaceRescue-portable.zip.
+# Produces build\dist\SpaceRescue-Setup-x64.exe and build\dist\SpaceRescue-portable.zip.
 # Usage: powershell -ExecutionPolicy Bypass -File package.ps1
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
@@ -23,7 +23,7 @@ Compress-Archive -Path (Join-Path $portable '*') -DestinationPath (Join-Path $di
 $setupSrc = Join-Path $stage 'setup'
 New-Item -ItemType Directory $setupSrc | Out-Null
 Copy-Item $exe $setupSrc
-$target = Join-Path $dist 'SpaceRescue-Setup-x86.exe'
+$target = Join-Path $dist 'SpaceRescue-Setup-x64.exe'
 $sed = @"
 [Version]
 Class=IEXPRESS
