@@ -1,0 +1,47 @@
+files=80 clean=1 failing=79 total_errors=1093 unique_sites=75
+--- error kinds (unique sites):
+  18x  use of undeclared identifier 'X'
+  18x  explicit specialization of 'X' after instantiation
+   6x  must explicitly qualify name of member function when taking its address
+   6x  no member named 'X' in namespace 'X'
+   5x  no matching constructor for initialization of 'X' (aka 'X')
+   5x  no matching function for call to 'X'
+   3x  no member named 'X' in 'X'
+   3x  constexpr if condition is not a constant expression
+   3x  cannot assign to variable 'X' with const-qualified type 'X' (aka 'X')
+   1x  reinterpret_cast from 'X' (aka 'X') to 'X' (aka 'X') is not allowed
+   1x  no member named 'X' in the global namespace
+   1x  static_cast from 'X' (aka 'X') to 'X' (aka 'X') is not allowed
+   1x  no matching conversion for functional-style cast from 'X' to 'X'
+   1x  member access into incomplete type 'X'
+   1x  use of undeclared identifier 'X'; did you mean 'X'?
+   1x  redefinition of 'X' as different kind of symbol
+   1x  call to constructor of 'X' (aka 'X') is ambiguous
+--- sample sites:
+shim/atlbase.h:91:74: no matching function for call to 'VariantChangeType'
+ws/BlockingQueue.h:145:19: no matching conversion for functional-style cast from 'const char[16]' to 'std::exception'
+ws/Item.h:294:79: member access into incomplete type 'const CItem'
+ws/Tracer.h:26:19: constexpr if condition is not a constant expression
+ws/UiApplication.h:137:29: use of undeclared identifier 'OwnerEnableScope'
+ws/UiApplication.h:138:29: use of undeclared identifier 'OwnerEnableScope'
+ws/UiApplication.h:139:28: use of undeclared identifier 'OwnerEnableScope'
+ws/UiPanes.h:423:34: must explicitly qualify name of member function when taking its address
+ws/UiPanes.h:424:34: must explicitly qualify name of member function when taking its address
+ws/UiPanes.h:425:27: must explicitly qualify name of member function when taking its address
+ws/UiPanes.h:512:27: must explicitly qualify name of member function when taking its address
+ws/UiPanes.h:513:27: must explicitly qualify name of member function when taking its address
+ws/UiPanes.h:514:27: must explicitly qualify name of member function when taking its address
+ws/UiTypes.h:13:38: use of undeclared identifier '_ITERATOR_DEBUG_LEVEL'
+ws\Controls\Sunburst.cpp:296:19: constexpr if condition is not a constant expression
+ws\Controls\TreeMap.cpp:1051:39: no member named 'par' in namespace 'std::execution'
+ws\Controls\TreeMap.cpp:660:19: constexpr if condition is not a constant expression
+ws\Controls\TreeMapLayout.cpp:123:28: use of undeclared identifier 'DBL_MAX'
+ws\Controls\WdsListControl.cpp:1127:5: cannot assign to variable 'wParam' with const-qualified type 'const WPARAM' (aka 'const unsigned long long')
+ws\Controls\WdsListControl.cpp:1128:5: cannot assign to variable 'lParam' with const-qualified type 'const LPARAM' (aka 'const long long')
+ws\CsvLoader.cpp:470:19: no matching constructor for initialization of 'std::ifstream' (aka 'basic_ifstream<char>')
+ws\CsvLoader.cpp:673:19: no matching constructor for initialization of 'std::ofstream' (aka 'basic_ofstream<char>')
+ws\CsvLoader.cpp:755:19: no matching constructor for initialization of 'std::ofstream' (aka 'basic_ofstream<char>')
+ws\CsvLoader.cpp:824:19: no matching constructor for initialization of 'std::ofstream' (aka 'basic_ofstream<char>')
+ws\Dialogs\AboutDlg.cpp:160:30: use of undeclared identifier 'LGIT_COMMIT'
+
+[exited with code 0]

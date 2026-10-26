@@ -35,7 +35,12 @@ Possible speed-up later: multi-threaded enumeration (upstream uses a work queue)
 - [x] llvm-mingw 20261020 (clang 23.1.4, x86_64, libc++) installed per-user via winget, no admin
 - [x] `build.ps1` → clang++ `-std=c++23`, x64, static, parallel jobs (one per core), `.d`-based incremental, `-Fast`/`-Release`/`-Clean`/`-Gcc`
 - [x] Clean build: 0 errors, 0 warnings. Full -O2 build 19.9 s, `-Fast` 6.6 s, one-file incremental **1.7 s**
-- [ ] Upstream spike (llvm-mingw + ATL shim, scratch copy): 293 → 24 unique error sites after qualifying `Route<&Handler>` member pointers (MSVC-only syntax). Remaining: 19 in-class route tables, generated `LangStrings.h`, a `Tracer.h` constexpr, 1 incomplete type. Link and runtime not attempted yet. **Decision pending**
+- [x] **Upstream spike, timebox used.** Compiled a scratch copy of `upstream/windirstat` with llvm-mingw plus a 120-line ATL shim (`tools/upstream-spike/`):
+  - Only 2 of 87 pch headers were missing under clang (ATL, xxhash).
+  - Qualifying 476 MSVC-style `Route<&Handler>` member pointers took the first-error sites from 293 to 24.
+  - Generating `LangStrings.h` then exposed the real count: **75 unique error sites, about 1,100 errors**, all MSVC/STL-specific: `std::execution::par` (absent in libc++), wide-path `ifstream`, `_ITERATOR_DEBUG_LEVEL`, explicit specialization after instantiation, generated git macros, const `WPARAM` writes, etc.
+  - Linking (GDI+, WMI, virtdisk) and runtime were never reached.
+  - **Decision: no true fork.** Making upstream build would mean editing dozens of upstream files, which breaks the minimal-churn rule. Instead we keep our app and port upstream's engines and views into it (treemap layout + cushion shader first), credited in `CONTRIBUTIONS.md`.
 
 ## Revamp – Phase C: fast scanner
 - [x] N workers (default min(cores, 8)) on a LIFO folder queue; `NtQueryDirectoryFile(FileFullDirectoryInformation)` with a 64 KiB per-thread buffer (faster than 1 MiB, measured); real `AllocationSize` from the FS (no per-file path strings or extra calls)
