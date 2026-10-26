@@ -81,6 +81,8 @@ public:
     void Detach(u32 i);
     // Finds a node by full path, NoNode if absent.
     u32 Find(const std::wstring& path) const;
+    // Case-insensitive substring match on a node's name (no allocation; for search-as-you-type).
+    bool NameContainsI(u32 i, const std::wstring& lowerNeedle) const;
     // Nodes reachable from the root, children before parents. Use this for bottom-up passes:
     // index order is NOT guaranteed to be parent-first (the MFT scanner indexes by record number).
     std::vector<u32> PostOrder() const;
