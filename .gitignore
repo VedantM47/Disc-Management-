@@ -22,3 +22,10 @@ intermediate/
 
 /.claude/
 /CLAUDE.md
+
+# local-only presentation scratch
+/LedgerLock.pptx
+/docs/reference/
+/docs/render/
+/docs/tmp_sheet/
+node_modules/

@@ -54,6 +54,17 @@ upstream/      WinDirStat source (GPL reference)
 See [ARCHITECTURE_NOTES.md](ARCHITECTURE_NOTES.md), [CONTRIBUTIONS.md](CONTRIBUTIONS.md), [USER_GUIDE.md](USER_GUIDE.md),
 [DESIGN.md](DESIGN.md), [STATUS_REPORT.md](STATUS_REPORT.md) and [PROGRESS.md](PROGRESS.md).
 
+## Presentation and viva material
+| File | What it is |
+|---|---|
+| [docs/SpaceRescue_Presentation.pptx](docs/SpaceRescue_Presentation.pptx) | Course presentation (33 slides) |
+| [docs/CHEAT_SHEET.docx](docs/CHEAT_SHEET.docx) / [.md](docs/CHEAT_SHEET.md) | What to say per slide, likely questions, run commands, all OS concepts and algorithms |
+| [docs/CONCEPTS_EXPLAINED.md](docs/CONCEPTS_EXPLAINED.md) | Every OS concept and algorithm, explained simply and then technically |
+| [docs/VIVA_QA.md](docs/VIVA_QA.md) | Viva questions and answers |
+
+Rebuild them: `python docs\build_presentation.py` (deck) and `node docs\build_cheatsheet.js docs\CHEAT_SHEET.docx`
+(cheat sheet; needs `npm install docx`).
+
 ## Credits and license
 SpaceRescue is free software under the **GNU GPL v3.0 or later** (see `LICENSE.md`). It builds on **WinDirStat**
 (© WinDirStat Team: Bernhard Seifert, Oliver Schneider, Bryan Berns and contributors), whose source is included in
