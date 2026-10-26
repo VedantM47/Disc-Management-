@@ -77,6 +77,21 @@ Possible speed-up later: multi-threaded enumeration (upstream uses a work queue)
 - [ ] Linked selection with Explore (Phase F, after approval)
 - Note: preview peak RAM is 304–314 MB on C: (scan 260 MB + kind model + analysis). Trim the kind model's temporary per-folder sums in Phase F.
 
+## Overnight additions (2026-10-27)
+- [x] **Quick-win pre-scan:** 13 hotspots sized at background priority alongside the full scan. **12.5 GB "safe to free" shown 3.0 s after launch** on C: (goal: first useful answer under 5 s)
+- [x] **Segmented cleanup engine** (`src/insights/cleanup.*`): ~60-rule data table + project rules. On C:: Windows temp 10.5 GB, app caches 10.3 GB, developer 36.2 GB (31 projects/caches + "smaller items"), old/unused 21.7 GB. Built in **63 ms**
+- [x] **System awareness:** `AnalyzeSystem` (Windows uses 70.8 GB, ~13.6 GB reducible with Windows tools) and `IsProtectedPath`
+- [x] **MFT fast path** (`scanner_mft.cpp`, port of FinderNtfs) for elevated whole-drive scans, with a fallback. `ScanTree::PostOrder()` makes bottom-up passes independent of node order. **NOT VERIFIED: needs an elevated run of `SpaceRescue.exe /bench C:`**
+- [x] `/bench [path]`: timing to the console/pipe (unelevated C: 6.5 s warm, 261 MB peak)
+- [x] Docs: `README.md`, `CONTRIBUTIONS.md`, `USER_GUIDE.md`, `DEMO_SCRIPT.md`
+- [x] Packages (x64, release): `SpaceRescue-Setup-x64.exe` 500 KB, `SpaceRescue-portable.zip` 397 KB, exe 832 KB
+- [x] Preview renders via `WM_PRINTCLIENT` too, and `SR_SNAPSHOT=file;ms` writes a frame to a BMP for docs
+
+## Next (after design approval)
+- Phase F: wire the new screens: Explore/Map selection linked to the tree, review lists + actions + undo toast in the new UI, Settings writes, command palette, the new UI as the default
+- Trim preview peak RAM (kind model temporaries) to ≤264 MB
+- Phase H verification needing admin: VHDX 0-byte test, MFT `/bench`, reserve file, install/uninstall, context menu
+
 ## Not yet verified
 
 - [ ] Elevated run: MFT stats vs `fsutil fsinfo ntfsinfo`
