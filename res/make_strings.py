@@ -1,0 +1,277 @@
+# Generates res/resource.h and res/app.rc from the string table below (stdlib only).
+# Run: python res/make_strings.py   (the .rc stays pure ASCII; {ndash} {mdash} {dot} {ell} are
+# replaced with the real characters at run time by ui::Str()).
+import os, re, sys
+
+S = [
+("APP_NAME", "SpaceRescue"),
+# --- Rescue Mode banner / reserve
+("BANNER_HEAD", "%ls is almost full (%ls free). Rescue Mode is on {mdash} SpaceRescue won't write anything to %ls."),
+("BANNER_MORE", "(+%d more low drives)"),
+("BANNER_NORESERVE", "No reserve file is set up on this PC."),
+("BANNER_NOWORK", "No other drive {mdash} changes stay in memory."),
+("BANNER_RELEASE", "Release reserve (frees %ls)"),
+("BANNER_WORK", "Work volume: %ls"),
+("RESERVE_CONFIRM", "Release the reserve file?\\n\\nThis frees %ls on the drive right away. SpaceRescue can create the reserve again later when there is room."),
+("RESERVE_FAILED", "Couldn't release the reserve file: %ls"),
+("RESERVE_RELEASED", "Reserve released {mdash} %ls freed."),
+("ZERO_BYTES", "0 bytes"),
+# --- chrome
+("BTN_BACK_RESULTS", "Back to results"),
+("BTN_CANCEL", "Cancel"),
+("BTN_RESCAN", "Rescan"),
+("BTN_SCAN_ANOTHER", "Scan another{ell}"),
+("TAB_INSIGHTS", "Insights"),
+("TAB_FOLDERS", "Folders"),
+("TAB_INTERNALS", "Disk Internals"),
+("CHOOSE_FOLDER_PROMPT", "Choose a folder to scan"),
+("ERR_PATH", "Can't open \"%ls\". Check that the folder exists and that you can read it."),
+("ERR_SCAN_FAILED", "The scan didn't finish. Try again, or choose a smaller folder."),
+("ERR_SCAN_START", "Couldn't start scanning %ls."),
+("DUR_HOURS", "%d h %d min"),
+("DUR_MINUTES", "%d min %d s"),
+("DUR_SECONDS", "%ls s"),
+("SHARE", "%ls {ndash} %ls"),
+("SHARE_OF", "%ls {ndash} %ls of %ls"),
+("ST_COUNTS", "%ls files {dot} %ls folders"),
+("ST_ERRORS", "%ls folders couldn't be read"),
+("ST_FOLDED", "%ls small files folded (memory budget)"),
+("ST_PEAK", "Peak memory %ls"),
+("ST_READY", "Ready"),
+("ST_SCANNING", "Scanning{ell}"),
+("ST_SETTINGS", "Settings: %ls"),
+("ST_SETTINGS_MEM", "Settings kept in memory (drive is full)"),
+("ST_TIME", "Scanned in %ls"),
+("ST_TREE", "Scan tree %ls"),
+("TOAST_DISMISS", "Dismiss"),
+("TOAST_RECYCLE_NOTE", "(Space is freed when you empty the Recycle Bin.)"),
+("TOAST_UNDO", "Undo"),
+("TOAST_UNDOING", "Undoing{ell}"),
+("TOAST_UNDONE", "Restored."),
+# --- home
+("HOME_TITLE", "Where is your space going?"),
+("HOME_SUB", "Pick a drive or folder to scan. You'll see what is using space and what is safe to clean up."),
+("HOME_CHOOSE", "Choose folder{ell}"),
+("HOME_SCAN_AGAIN", "Scan again: %ls"),
+("HOME_DRIVES", "Drives"),
+("HOME_LOCAL_DISK", "Local Disk"),
+("HOME_SYSTEM", "System"),
+("HOME_LOW", "Low space"),
+("HOME_SCAN", "Scan"),
+("HOME_USED", "%ls used of %ls"),
+("HOME_FREE_WORD", "free"),
+("HOME_RESCUE_NOTE", "Rescue Mode: scans at low priority and stores nothing on this drive."),
+("HOME_NODRIVES_T", "No drives found"),
+("HOME_NODRIVES_B", "SpaceRescue couldn't list any drives. You can still choose a folder to scan."),
+("HOME_PRIVACY", "SpaceRescue only reads file names, sizes and dates. File contents are read only if you run the duplicate search. Nothing is changed until you review a list and confirm."),
+# --- scanning
+("SCAN_TITLE", "Scanning %ls"),
+("SCAN_SUB", "Reading file names, sizes and dates. This only reads; nothing is changed."),
+("SCAN_CANCELLING", "Cancelling{ell}"),
+("SCAN_FILES", "files"),
+("SCAN_FOLDERS", "folders"),
+("SCAN_SIZE", "found so far"),
+("SCAN_CONTEXT", "About %ls of the %ls used on this drive read so far"),
+("SCAN_ELAPSED", "Elapsed: %ls"),
+("SCAN_STARTING", "Starting{ell}"),
+("SCAN_RESCUE", "Rescue Mode is on. Nothing is written to any drive that is almost full."),
+("SCAN_RESCUE_LOW", "Rescue Mode is on: this drive is almost full, so the scan runs at low priority and writes nothing to it."),
+("SCAN_BUDGET", "Tree memory is capped at %ls; small files are folded into one entry per folder once it is reached."),
+("SCAN_WAS_CANCELLED", "Scan cancelled."),
+# --- insights
+("INS_ANALYZING_SHORT", "Analyzing{ell}"),
+("INS_LOADING_T", "Analyzing your files{ell}"),
+("INS_LOADING_B", "Looking for caches, installers, old downloads and stale files in the scan results. Nothing is written to disk."),
+("INS_FAILED_T", "Couldn't analyze this scan"),
+("INS_FAILED_B", "The analysis didn't finish. Scan again to retry."),
+("INS_NOSCAN_T", "No scan yet"),
+("INS_NOSCAN_B", "Choose a drive or folder to scan first."),
+("INS_EMPTY_T", "Nothing to analyze"),
+("INS_EMPTY_B", "This location is empty."),
+("INS_EMPTY_ERR", "Nothing could be read here. Try running SpaceRescue as administrator, or pick another folder."),
+("INS_RING_USED", "used"),
+("INS_RECLAIMABLE", "safely reclaimable"),
+("INS_RECLAIM_NOTE", "Estimated from the categories below. Nothing is deleted until you review the list and confirm."),
+("INS_USAGE", "%ls used of %ls {dot} Free: %ls"),
+("INS_FOLDER_OF", "Folder %ls (on %ls)"),
+("INS_FOLDER_SIZE", "Folder size: %ls"),
+("INS_SCANNED", "Scanned %ls files and %ls folders in %ls"),
+("INS_SEC_HOGS", "Top space hogs"),
+("INS_SEC_HOGS_SUB", "The biggest folders and files, with what they usually are."),
+("INS_HOGS_FOLDERS", "Largest folders"),
+("INS_HOGS_FILES", "Largest files"),
+("INS_SHOW", "Show"),
+("INS_REVIEW", "Review{ell}"),
+("INS_SHARE_OF", "%ls of %ls"),
+("INS_FILES_COUNT", "%ls files"),
+("INS_SEC_CATS", "Smart categories"),
+("INS_SEC_CATS_SUB", "Things that are usually safe to clean up. You always review the list first."),
+("INS_SAFE", "Usually safe"),
+("INS_CHECK", "Check first"),
+("INS_CLEANMGR", "Open Disk Cleanup"),
+("INS_CATS_EMPTY_T", "Nothing to clean up here"),
+("INS_CATS_EMPTY_B", "None of the usual suspects (caches, installers, old downloads) turned up in this scan."),
+("INS_CATS_NONE", "Nothing found in: %ls."),
+("INS_SEC_DUP", "Duplicate files"),
+("INS_SEC_DUP_SUB", "Finds identical files by comparing their contents. Optional, because it reads files from disk."),
+("INS_DUP_FIND", "Find duplicates"),
+("INS_DUP_CANCEL", "Cancel"),
+("INS_DUP_CANCELLING", "Cancelling{ell}"),
+("INS_DUP_CANCELLED", "Duplicate search cancelled. No files were changed."),
+("INS_DUP_HINT", "Compares the contents of files of %ls or larger. Reads from disk, so it can take a while."),
+("INS_DUP_RUNNING", "Comparing files of %ls or larger{ell} %ls elapsed"),
+("INS_DUP_NONE", "No duplicates found among files of %ls or larger."),
+("INS_DUP_FOUND", "%ls in %ls duplicate files"),
+("INS_DUP_FOUND_NOTE", "Keep one copy of each and review the rest."),
+("INS_SEC_STALE", "Stale files"),
+("INS_SEC_STALE_SUB", "Files you probably haven't touched in a long time."),
+("INS_STALE_ROW", "Not used for %d+ months"),
+("INS_STALE_NONE", "Nothing found"),
+("INS_SIGNAL_ACCESS", "Signal used: last access time. %ls"),
+("INS_SIGNAL_MODIFIED", "Signal used: last modified time. %ls"),
+("INS_SEC_GROWTH", "Growth since last scan"),
+("INS_SEC_GROWTH_SUB", "Compared with the scan from %ls."),
+("INS_GROWTH_EMPTY_T", "First scan here {mdash} growth shows up next time"),
+("INS_GROWTH_EMPTY_B", "SpaceRescue keeps a small snapshot of folder sizes so the next scan can show what grew."),
+("INS_GROWTH_NOSNAP", "Snapshots are not saved because no drive with enough free space is available."),
+("INS_GROWTH_NONE_T", "No notable changes since the last scan"),
+("INS_GROWTH_NONE_B", "Folder sizes are about the same as last time."),
+("INS_GROWTH_NOW", "now %ls"),
+# --- folders
+("FP_TITLE", "Folders"),
+("FP_EMPTY", "Scan a drive or folder first, then browse it here."),
+("FP_HINT", "Biggest first. Percentages are shares of %ls. Expand a folder to look inside; right-click for actions."),
+("FP_ITEM", "%ls {mdash} %ls (%ls)"),
+("FP_CLOUD", "(cloud file, not stored locally)"),
+("FP_LINK", "(link, not followed)"),
+("FP_ERROR", "(some items couldn't be read)"),
+("FP_MORE", "{ell} %ls more, smaller items"),
+("FP_MODIFIED", "last modified %ls"),
+("FP_MENU_OPEN", "Open location"),
+("FP_MENU_INTERNALS", "Show in Disk Internals"),
+("FP_MENU_COPY", "Copy path"),
+("FP_MENU_REVIEW", "Review and remove{ell}"),
+("FP_REVIEW_BLURB", "%ls. Nothing is removed until you confirm."),
+("FP_WAIT_ANALYSIS", "SpaceRescue is still analyzing this scan. Please try again in a moment."),
+# --- internals
+("IN_TITLE", "Disk Internals"),
+("IN_EMPTY", "Scan a drive or folder to see how its volume is laid out."),
+("IN_WHAT", "What does this mean?"),
+("IN_VOLUME", "Volume %ls {dot} %ls"),
+("IN_CLUSTER", "Cluster size"),
+("IN_CLUSTER_V", "%ls (%ls bytes), %ls bytes per sector"),
+("IN_CLUSTERS", "Clusters"),
+("IN_CLUSTERS_V", "%ls total {dot} %ls free (%ls {ndash} %ls)"),
+("IN_MFT", "Master File Table"),
+("IN_MFT_V", "%ls {dot} %ls records of %ls each"),
+("IN_MFT_ADMIN", "Run as administrator to read MFT statistics"),
+("IN_MFT_ERR", "MFT statistics unavailable: %ls"),
+("IN_MFT_NOTNTFS", "Not an NTFS volume {mdash} there is no MFT"),
+("IN_SLACK", "Slack space (estimate)"),
+("IN_SLACK_V", "About %ls wasted across %ls files, including %ls from files smaller than one cluster."),
+("IN_SLACK_SHARE", "That is %ls of the data scanned."),
+("IN_FILE_TITLE", "A single file"),
+("IN_BROWSE", "Browse{ell}"),
+("IN_FILE_EMPTY", "Pick a file in the Folders tab (double-click it) or press Browse{ell} to see where it sits on the disk."),
+("IN_FILE_ERR", "Couldn't read this file's layout: %ls"),
+("IN_FILTER_ALL", "All files (*.*)"),
+("IN_THIS_SCAN", "this scan"),
+("IN_LOGICAL", "Size (what Explorer shows)"),
+("IN_ONDISK", "Size on disk"),
+("IN_RESIDENT_NOTE", "tiny file kept inside the MFT"),
+("IN_FILE_SLACK", "Slack in this file"),
+("IN_FILE_SLACK_V", "%ls (%ls of its size on disk)"),
+("IN_FLAGS", "Properties"),
+("IN_FLAG_RESIDENT", "Stored in MFT"),
+("IN_FLAG_COMPRESSED", "NTFS compressed"),
+("IN_FLAG_SPARSE", "Sparse"),
+("IN_FLAG_ENCRYPTED", "Encrypted"),
+("IN_FLAG_LINKS", "%ls hard links"),
+("IN_FLAG_PLAIN", "Ordinary file"),
+("IN_FRAGMENTS", "Pieces on disk"),
+("IN_FRAG_RESIDENT", "None {mdash} it lives inside the file table"),
+("IN_FRAG_ONE", "1 piece {mdash} not fragmented"),
+("IN_FRAG_MANY", "%ls pieces (fragments)"),
+("IN_COMPRESSION", "Compression"),
+("IN_STRIP_TITLE", "Where the file sits on the volume"),
+("IN_STRIP_LEGEND", "%ls clusters ({dot} %ls) in total. Each block is one run of consecutive clusters; dotted gaps take no space."),
+("IN_EXTENT", "Run %ls: starts at cluster %ls {dot} %ls clusters (%ls)"),
+("IN_EXTENT_HOLE", "Run %ls: gap of %ls clusters (sparse or compressed, takes no space)"),
+("IN_EXTENT_MORE", "{ell} and %ls more runs"),
+("IN_FRAG_TITLE", "Most fragmented files"),
+("IN_FRAG_LOADING", "Reading where the %ls largest files sit on disk{ell}"),
+("IN_FRAG_NONE", "None of the %ls largest files is split into several pieces. Nice."),
+("IN_FRAG_NOSCAN", "Scan a drive or folder first."),
+("IN_FRAG_SUB", "%ls of the %ls largest files are split into several pieces. Double-click one to inspect it."),
+("IN_COL_FILE", "File"),
+("IN_COL_FRAGS", "Fragments"),
+("IN_COL_SIZE", "Size"),
+# --- review dialog
+("RV_COL_NAME", "Name"),
+("RV_COL_SIZE", "Size"),
+("RV_COL_DATE", "Last used / modified"),
+("RV_COL_FOLDER", "Folder"),
+("RV_SELECT_ALL", "Select all"),
+("RV_SELECT_NONE", "Select none"),
+("RV_OPEN_LOCATION", "Open location"),
+("RV_RECYCLE", "Move to Recycle Bin"),
+("RV_QUARANTINE", "Move to quarantine"),
+("RV_COMPRESS", "Compress (NTFS)"),
+("RV_DELETE", "Delete permanently{ell}"),
+("RV_NONE_SELECTED", "0 selected {dot} %ls items to review"),
+("RV_SELECTED", "%ls selected {dot} %ls"),
+("RV_OF_DRIVE", "(%ls of %ls)"),
+("RV_NOTE_RECYCLE", "The Recycle Bin keeps files on their own drive, so it frees no space until you empty it."),
+("RV_NOTE_QUARANTINE", "Quarantine copies files to the SpaceRescue-Quarantine folder on %ls, then removes the originals, so space is freed right away and you can undo."),
+("RV_NO_WORKVOL", "Quarantine is unavailable: there is no other drive with free space."),
+("RV_NOT_NTFS", "Compression needs an NTFS drive."),
+("RV_WORKING", "Working{ell} Please keep this window open."),
+("CONFIRM_TITLE", "Please confirm"),
+("CONFIRM_DELETE_TITLE", "Delete permanently"),
+("CONFIRM_WHAT", "%ls item(s) totalling %ls"),
+("CONFIRM_RECYCLE", "Move %ls to the Recycle Bin?\\n\\nYou can restore them from the Recycle Bin. The space is only freed once the Recycle Bin is emptied."),
+("CONFIRM_QUARANTINE", "Move %ls to quarantine?\\n\\nThe files are copied to the SpaceRescue-Quarantine folder on %ls, verified, and then removed from their original place. That frees the space right away, and you can undo it."),
+("CONFIRM_COMPRESS", "Compress %ls with NTFS compression?\\n\\nFiles stay where they are and keep working. How much space you save depends on the file types; some are already compressed."),
+("CONFIRM_DELETE", "Permanently delete %ls?\\n\\nThey will NOT go to the Recycle Bin and this cannot be undone."),
+("ACTION_FAILED", "Nothing was changed. The action could not be completed."),
+("ACTION_PARTIAL", "%ls item(s) could not be processed:"),
+]
+
+root = os.path.dirname(os.path.abspath(__file__))
+names = [n for n, _ in S]
+assert len(set(names)) == len(names), "duplicate ids"
+
+# every IDS_ constant used by the sources must exist
+used = set()
+src = os.path.join(root, '..', 'src')
+for d, _, files in os.walk(src):
+    for f in files:
+        if f.endswith(('.cpp', '.h')):
+            used |= set(re.findall(r'\bIDS_([A-Z0-9_]+)', open(os.path.join(d, f), encoding='utf-8').read()))
+missing = sorted(used - set(names))
+unused = sorted(set(names) - used)
+if missing:
+    print('MISSING strings:', ', '.join(missing)); sys.exit(1)
+if unused:
+    print('note: unused strings:', ', '.join(unused))
+
+with open(os.path.join(root, 'resource.h'), 'w') as h:
+    h.write('// Generated by res/make_strings.py - do not edit by hand.\n#pragma once\n\n')
+    h.write('#define IDI_APP 1\n\n')
+    for i, n in enumerate(names):
+        h.write('#define IDS_%s %d\n' % (n, 1000 + i))
+
+with open(os.path.join(root, 'app.rc'), 'w') as r:
+    r.write('// SpaceRescue resources. Generated by res/make_strings.py - edit the script, not this file.\n')
+    r.write('#include "resource.h"\n\n')
+    r.write('IDI_APP ICON "app.ico"\n')
+    r.write('1 24 "app.manifest"\n\n')
+    r.write('1 VERSIONINFO\n FILEVERSION 1,0,0,0\n PRODUCTVERSION 1,0,0,0\nBEGIN\n BLOCK "StringFileInfo"\n BEGIN\n  BLOCK "040904B0"\n  BEGIN\n')
+    r.write('   VALUE "FileDescription", "SpaceRescue - disk space management with Rescue Mode"\n   VALUE "ProductName", "SpaceRescue"\n   VALUE "FileVersion", "1.0.0.0"\n   VALUE "ProductVersion", "1.0.0.0"\n   VALUE "LegalCopyright", "GPL-3.0-or-later. Inspired by WinDirStat."\n')
+    r.write('  END\n END\n BLOCK "VarFileInfo"\n BEGIN\n  VALUE "Translation", 0x0409, 1200\n END\nEND\n\n')
+    r.write('STRINGTABLE\nBEGIN\n')
+    for n, t in S:
+        assert all(ord(c) < 128 for c in t), n
+        r.write('    IDS_%s "%s"\n' % (n, t.replace('"', '""') if '\\"' not in t else t.replace('\\"', '""')))
+    r.write('END\n')
+print('wrote %d strings' % len(S))
