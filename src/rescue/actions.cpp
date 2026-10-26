@@ -1,6 +1,7 @@
 // SpaceRescue - SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "actions.h"
+#include "../insights/cleanup.h"
 
 namespace sr
 {
@@ -319,7 +320,8 @@ void ActionManager::AppendLog(const Entry& entry, const int id)
     if (!h.valid()) return;
     for (const auto& m : entry.moves)
     {
-        const std::string line = Utf8(Fmt(L"%d\t%s\t%s\t%s\r\n", id, KindName(entry.kind), m.first.c_str(), m.second.c_str()));
+        // Built by hand: Fmt() truncates at 1023 chars, which would cut long paths and the line break.
+        const std::string line = Utf8(std::to_wstring(id) + L"\t" + KindName(entry.kind) + L"\t" + m.first + L"\t" + m.second + L"\r\n");
         DWORD w;
         WriteFile(h.h, line.data(), static_cast<DWORD>(line.size()), &w, nullptr);
     }
@@ -327,6 +329,7 @@ void ActionManager::AppendLog(const Entry& entry, const int id)
 
 bool ActionManager::CanUndo(const int undoId) const
 {
+    std::lock_guard<std::mutex> guard(m_mutex);
     return undoId >= 0 && static_cast<size_t>(undoId) < m_entries.size() && !m_entries[undoId].undone &&
            m_entries[undoId].kind != ActionKind::DeletePermanent;
 }
@@ -372,6 +375,17 @@ ActionResult ActionManager::Apply(const ActionKind kind, const std::vector<std::
     {
         DWORD e = ERROR_SUCCESS;
         std::wstring dest = path;
+        // Defense in depth: never remove/move system areas or a drive root, whatever the UI passed.
+        if (kind != ActionKind::Compress && (path.size() < 4 || IsProtectedPath(path)))
+        {
+            r.failed.push_back({ path, L"Protected system location." });
+            continue;
+        }
+        if (kind == ActionKind::Quarantine && VolumeOf(path).empty())
+        {
+            r.failed.push_back({ path, L"Only local drive paths can be quarantined." });
+            continue;
+        }
         switch (kind)
         {
         case ActionKind::Recycle:
@@ -434,8 +448,11 @@ ActionResult ActionManager::Apply(const ActionKind kind, const std::vector<std::
 
     if (kind != ActionKind::DeletePermanent && !entry.moves.empty())
     {
-        r.undoId = static_cast<int>(m_entries.size());
-        m_entries.push_back(entry);
+        {
+            std::lock_guard<std::mutex> guard(m_mutex);
+            r.undoId = static_cast<int>(m_entries.size());
+            m_entries.push_back(entry);
+        }
         AppendLog(entry, r.undoId);
         if (kind == ActionKind::Recycle) r.summary += L" Undo restores them from the Recycle Bin.";
     }

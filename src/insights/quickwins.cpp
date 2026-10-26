@@ -53,7 +53,11 @@ void QuickWins::Start(const std::wstring& drive)
     {
         if (_wcsicmp(VolumeOf(s.path).c_str(), drive.c_str()) != 0) continue;
         const size_t slot = m_items.size();
-        m_items.push_back({ s.label, 0, false, s.safe });
+        {
+            // Earlier worker threads write m_items[slot] under m_lock; a reallocation must not race them.
+            std::lock_guard<std::mutex> guard(m_lock);
+            m_items.push_back({ s.label, 0, false, s.safe });
+        }
         ++m_running;
         m_threads.emplace_back([this, slot, s] {
             SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN); // never slow the main scan

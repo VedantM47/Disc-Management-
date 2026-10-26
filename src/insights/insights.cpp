@@ -50,8 +50,9 @@ bool InList(const std::wstring& v, const wchar_t* const* list, size_t n)
 
 const wchar_t* kVideoExt[] = { L".mp4", L".mkv", L".mov", L".avi", L".wmv", L".flv", L".webm", L".m4v", L".mpg", L".mpeg", L".ts", L".vob" };
 const wchar_t* kInstallerExt[] = { L".msi", L".iso", L".msix", L".msixbundle", L".appx" };
-const wchar_t* kDevNames[] = { L"node_modules", L".gradle", L".m2", L"__pycache__", L"npm-cache", L".cache" };
-const wchar_t* kDevSuffixes[] = { L"\\.nuget\\packages", L"\\pip\\cache", L"\\yarn\\cache" };
+// ~\.m2 holds settings.xml and ~\.gradle holds gradle.properties (credentials): only their caches are reclaimable.
+const wchar_t* kDevNames[] = { L"node_modules", L"__pycache__", L"npm-cache", L".cache" };
+const wchar_t* kDevSuffixes[] = { L"\\.nuget\\packages", L"\\pip\\cache", L"\\yarn\\cache", L"\\.m2\\repository", L"\\.gradle\\caches" };
 
 struct ExplanationEntry { Category c; const wchar_t* title; const wchar_t* text; bool reclaimable; };
 const ExplanationEntry kCategories[] = {

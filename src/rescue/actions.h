@@ -8,6 +8,9 @@
 
 #include "../core/common.h"
 
+#include <deque>
+#include <mutex>
+
 namespace sr
 {
 enum class ActionKind
@@ -55,7 +58,8 @@ private:
     };
     void AppendLog(const Entry& entry, int id);
 
-    std::vector<Entry> m_entries;
+    mutable std::mutex m_mutex;       // Apply runs on worker threads while the UI calls CanUndo/Undo
+    std::deque<Entry> m_entries;      // deque: push_back never invalidates references held by Undo
     std::wstring m_logPath;
 };
 }

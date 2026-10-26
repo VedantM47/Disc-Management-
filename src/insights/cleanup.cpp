@@ -278,6 +278,9 @@ CleanupReport BuildCleanup(const ScanTree& tree, const InsightsReport* insights)
             const NameRule* rule = nullptr;
             for (const NameRule& nr : kNameRules)
                 if (_wcsicmp(nr.name, name.c_str()) == 0 && (!*nr.sibling || HasChild(tree, dir, nr.sibling))) { rule = &nr; break; }
+            // A real virtual environment holds pyvenv.cfg; a plain "venv" folder may be a Python stdlib package (Lib\venv).
+            if (rule && (_wcsicmp(rule->name, L"venv") == 0 || _wcsicmp(rule->name, L".venv") == 0) && !HasChild(tree, c, L"pyvenv.cfg"))
+                rule = nullptr;
             if (!rule)
             {
                 stack.push_back(c);
@@ -420,8 +423,14 @@ bool IsProtectedPath(const std::wstring& path)
 {
     const std::wstring win = KnownFolder(CSIDL_WINDOWS);
     const std::wstring sys = VolumeOf(win);
-    const std::wstring p = ToLower(path);
+    std::wstring p = ToLower(path);
+    while (p.size() > 3 && p.back() == L'\\') p.pop_back(); // "C:\Program Files\" == "C:\Program Files"
     const std::wstring lw = ToLower(win);
+    // Drive roots and the folders that hold every profile / all shared data are never removable as a whole.
+    if (p.size() <= 3 && p.size() >= 2 && p[1] == L':') return true;
+    if (p == ToLower(sys) + L"users" || p == ToLower(sys) + L"programdata") return true;
+    const std::wstring prof = ToLower(KnownFolder(CSIDL_PROFILE));
+    if (!prof.empty() && p == prof) return true;
     // Inside Windows-managed areas, these are meant to be cleaned (Disk Cleanup removes them too).
     static const wchar_t* cleanable[] = { L"\\temp", L"\\softwaredistribution\\download", L"\\minidump",
         L"\\serviceprofiles\\networkservice\\appdata\\local\\microsoft\\windows\\deliveryoptimization" };
