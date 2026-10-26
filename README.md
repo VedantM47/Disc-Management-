@@ -22,6 +22,12 @@ temp files, settings writes and lots of RAM. SpaceRescue is designed for exactly
 | **Low-space alerts** | A tray watcher (1.6 MB RAM) that sends a quiet notification at 50/20/10/5/3/2/1 GB and 512 MB free. |
 | **Explorer and setup** | "Analyze with SpaceRescue" on folders, folder backgrounds and drives. A per-user installer, a portable zip, and no DLL dependencies. |
 
+## Install
+Download [release/SpaceRescue-Setup-x64.exe](release/SpaceRescue-Setup-x64.exe) and double-click it. It installs for the
+current user (no admin), adds a Start menu entry, "Analyze with SpaceRescue" in Explorer and the low-space tray alert.
+Remove it from **Settings > Apps**. No install wanted? Use [release/SpaceRescue-portable.zip](release/SpaceRescue-portable.zip).
+The exe is not code-signed, so Windows SmartScreen may ask once: click **More info > Run anyway**.
+
 ## Build (no Visual Studio, no admin)
 ```powershell
 winget install MartinStorsjo.LLVM-MinGW.UCRT          # clang 23, per-user
