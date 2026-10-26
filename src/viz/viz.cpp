@@ -176,6 +176,7 @@ void Treemap::Render(const ScanTree& tree, const KindModel& kinds, const gfx::Pa
     m_height = std::max(1, height);
     m_pixels.assign(static_cast<size_t>(m_width) * m_height, 0);
     m_tiles.clear();
+    m_all.clear();
     // Light source as in upstream TreeMap.cpp: (lx, ly, 10) normalised.
     const float len = std::sqrt(options.lightX * options.lightX + options.lightY * options.lightY + 100.0f);
     m_lx = options.lightX / len;
@@ -203,6 +204,7 @@ void Treemap::Node(const ScanTree& tree, const KindModel& kinds, const gfx::Pale
         s[1] -= hf;
     }
 
+    m_all.push_back({ x0, y0, x1, y1, node });
     const sr::Node& n = tree.At(node);
     const bool leaf = !(n.flags & NF_DIR) || n.firstChild == NoNode || depth >= m_opt.maxDepth ||
         (x1 - x0) * (y1 - y0) <= 4;
@@ -299,6 +301,13 @@ void Treemap::Cushion(const int x0, const int y0, const int x1, const int y1, co
     }
 }
 
+bool Treemap::RectOf(const u32 node, TileRect* out) const
+{
+    for (const TileRect& t : m_all)
+        if (t.node == node) { *out = t; return true; }
+    return false;
+}
+
 u32 Treemap::Hit(const int x, const int y) const
 {
     for (auto it = m_tiles.rbegin(); it != m_tiles.rend(); ++it)
@@ -309,7 +318,7 @@ u32 Treemap::Hit(const int x, const int y) const
 // --- Flame graph ----------------------------------------------------------------
 
 void FlameGraph::Draw(gfx::Canvas& c, const ScanTree& tree, const KindModel& kinds, const u32 root, const D2D1_RECT_F& area,
-    const float rowHeight, const int maxDepth) const
+    const float rowHeight, const int maxDepth, std::vector<std::pair<D2D1_RECT_F, u32>>* hits, const u32 selected) const
 {
     const gfx::Palette& p = c.P();
     const double total = static_cast<double>(std::max<u64>(1, tree.At(root).size));
@@ -326,6 +335,8 @@ void FlameGraph::Draw(gfx::Canvas& c, const ScanTree& tree, const KindModel& kin
         if (w < 1.0 || y + rowHeight > area.bottom) continue;
         const D2D1_RECT_F r = { static_cast<float>(it.x), y, static_cast<float>(it.x + w) - 1.0f, y + rowHeight - 2.0f };
         c.FillRound(r, 3.0f, p.Kind(kinds.Of(it.node)).Mix(p.base, it.depth == 0 ? 0.0f : 0.15f));
+        if (it.node == selected) c.StrokeRound(r, 3.0f, p.text, 2.0f);
+        if (hits) hits->push_back({ r, it.node });
         if (w > 48)
             c.Text(tree.Name(it.node) + L"  " + FormatBytes(n.size), { r.left + 6, r.top, r.right - 4, r.bottom },
                 gfx::Text::Caption, p.dark ? gfx::Color(0x0E1116) : gfx::Color(0xFFFFFF), gfx::Align::Left, true);
