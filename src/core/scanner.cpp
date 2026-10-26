@@ -1,54 +1,228 @@
 // SpaceRescue - SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Enumeration follows upstream WinDirStat's FinderBasic (NtQueryDirectoryFile with a large
+// per-thread buffer) and its BlockingQueue/ScanItems worker model, rewritten for our compact tree.
 
 #include "scanner.h"
 
 namespace sr
 {
+namespace
+{
+using NtStatus = LONG;
+constexpr NtStatus StatusNoMoreFiles = static_cast<NtStatus>(0x80000006L);
+constexpr int FileFullDirectoryInformation = 2;
+
+struct IoStatus
+{
+    union { NtStatus status; void* pointer; };
+    ULONG_PTR information;
+};
+
+struct FullDirInfo
+{
+    ULONG nextEntryOffset;
+    ULONG fileIndex;
+    LARGE_INTEGER creationTime;
+    LARGE_INTEGER lastAccessTime;
+    LARGE_INTEGER lastWriteTime;
+    LARGE_INTEGER changeTime;
+    LARGE_INTEGER endOfFile;
+    LARGE_INTEGER allocationSize;
+    ULONG fileAttributes;
+    ULONG fileNameLength; // bytes
+    ULONG eaSize;         // holds the reparse tag for reparse points
+    WCHAR fileName[1];
+};
+
+using NtQueryDirectoryFileFn = NtStatus (NTAPI*)(HANDLE, HANDLE, void*, void*, IoStatus*, void*, ULONG, int,
+    BOOLEAN, void*, BOOLEAN);
+
+NtQueryDirectoryFileFn LoadNtQuery()
+{
+    static const auto fn = reinterpret_cast<NtQueryDirectoryFileFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryDirectoryFile")));
+    return fn;
+}
+
+constexpr DWORD CloudAttributes = FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
+
+// One directory entry, copied out of the enumeration buffer before nodes are reserved.
+struct Entry
+{
+    u32 nameOffset;
+    u32 nameLen;
+    DWORD attributes;
+    u64 size;
+    u64 alloc;
+    u64 writeTime;
+    u64 accessTime;
+};
+
+// Per-thread scratch reused for every folder: no allocations on the hot path once warm.
+struct Scratch
+{
+    std::vector<BYTE> buffer = std::vector<BYTE>(64 * KiB); // measured: faster than 1 MiB and less RAM
+    std::vector<Entry> entries;
+    std::vector<wchar_t> names;
+};
+thread_local Scratch t_scratch;
+
+bool IsDots(const wchar_t* n, size_t len)
+{
+    return (len == 1 && n[0] == L'.') || (len == 2 && n[0] == L'.' && n[1] == L'.');
+}
+
+// Fills t_scratch.entries for `path`. Returns ERROR_SUCCESS or a Win32 error.
+DWORD Enumerate(const std::wstring& path)
+{
+    Scratch& s = t_scratch;
+    s.entries.clear();
+    s.names.clear();
+    auto add = [&](const wchar_t* name, size_t len, DWORD attr, u64 size, u64 alloc, u64 write, u64 access)
+    {
+        if (IsDots(name, len)) return;
+        s.entries.push_back({ static_cast<u32>(s.names.size()), static_cast<u32>(len), attr, size, alloc, write, access });
+        s.names.insert(s.names.end(), name, name + len);
+    };
+
+    if (const auto ntQuery = LoadNtQuery())
+    {
+        Handle dir(CreateFileW(LongPath(path).c_str(), FILE_LIST_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+        if (!dir.valid()) return GetLastError();
+        bool restart = true;
+        for (;;)
+        {
+            IoStatus io = {};
+            const NtStatus st = ntQuery(dir.h, nullptr, nullptr, nullptr, &io, s.buffer.data(),
+                static_cast<ULONG>(s.buffer.size()), FileFullDirectoryInformation, FALSE, nullptr, restart);
+            restart = false;
+            if (st == StatusNoMoreFiles) break;
+            if (st < 0) return s.entries.empty() ? ERROR_ACCESS_DENIED : ERROR_SUCCESS;
+            for (const BYTE* p = s.buffer.data();;)
+            {
+                const auto* e = reinterpret_cast<const FullDirInfo*>(p);
+                add(e->fileName, e->fileNameLength / sizeof(WCHAR), e->fileAttributes,
+                    static_cast<u64>(e->endOfFile.QuadPart), static_cast<u64>(e->allocationSize.QuadPart),
+                    static_cast<u64>(e->lastWriteTime.QuadPart), static_cast<u64>(e->lastAccessTime.QuadPart));
+                if (!e->nextEntryOffset) break;
+                p += e->nextEntryOffset;
+            }
+        }
+        return ERROR_SUCCESS;
+    }
+
+    // Fallback: Win32 enumeration without 8.3 names.
+    WIN32_FIND_DATAW fd;
+    HANDLE find = FindFirstFileExW(LongPath(JoinPath(path, L"*")).c_str(), FindExInfoBasic, &fd,
+        FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+    if (find == INVALID_HANDLE_VALUE)
+    {
+        const DWORD error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND ? ERROR_SUCCESS : error;
+    }
+    do
+    {
+        const u64 size = (static_cast<u64>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
+        add(fd.cFileName, wcslen(fd.cFileName), fd.dwFileAttributes, size, size,
+            Ticks(fd.ftLastWriteTime), Ticks(fd.ftLastAccessTime));
+    }
+    while (FindNextFileW(find, &fd));
+    FindClose(find);
+    return ERROR_SUCCESS;
+}
+}
+
 // --- ScanTree ----------------------------------------------------------------
 
-ScanTree::ScanTree(const std::wstring& path) : rootPath(path)
+ScanTree::ScanTree(const std::wstring& path) :
+    rootPath(path),
+    m_nodes(new std::atomic<Node*>[MaxNodeChunks]()),
+    m_names(new std::atomic<BYTE*>[MaxNameChunks]())
 {
     std::wstring name = path;
     if (name.size() > 3 && name.back() == L'\\') name.pop_back();
-    const u32 root = NewNode(NoNode, name.c_str(), name.size());
+    const u32 root = ReserveNodes(1);
+    InitNode(root, NoNode, m_mainCursor, name.c_str(), name.size());
     At(root).flags = NF_DIR;
 }
 
-u32 ScanTree::AddName(const wchar_t* name, const size_t len)
+ScanTree::~ScanTree()
 {
-    if (m_names.empty() || m_nameUsed + len + 1 > NameChunk)
-    {
-        m_names.emplace_back(new wchar_t[NameChunk]);
-        m_nameUsed = 0;
-    }
-    const u32 handle = static_cast<u32>((m_names.size() - 1) * NameChunk + m_nameUsed);
-    wchar_t* dst = m_names.back().get() + m_nameUsed;
-    wmemcpy(dst, name, len);
-    dst[len] = L'\0';
-    m_nameUsed += static_cast<u32>(len + 1);
-    return handle;
+    for (u32 i = 0; i < MaxNodeChunks; ++i) delete[] m_nodes[i].load();
+    for (u32 i = 0; i < MaxNameChunks; ++i) delete[] m_names[i].load();
 }
 
-u32 ScanTree::NewNode(const u32 parent, const wchar_t* name, const size_t len)
+u32 ScanTree::ReserveNodes(const u32 n)
 {
-    if ((m_count >> NodeShift) >= m_nodes.size()) m_nodes.emplace_back(new Node[NodeMask + 1]);
-    const u32 index = m_count++;
+    const u32 first = m_count.fetch_add(n, std::memory_order_acq_rel);
+    for (u32 c = first >> NodeShift; c <= (first + n - 1) >> NodeShift; ++c)
+    {
+        if (m_nodes[c].load(std::memory_order_acquire)) continue;
+        std::lock_guard<std::mutex> guard(m_chunkLock);
+        if (!m_nodes[c].load(std::memory_order_relaxed))
+        {
+            m_nodes[c].store(new Node[NodeMask + 1], std::memory_order_release);
+            m_nodeChunks.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return first;
+}
+
+void ScanTree::SetName(Node& node, NameCursor& cursor, const wchar_t* name, const size_t len)
+{
+    const bool wide = std::any_of(name, name + len, [](wchar_t c) { return c >= 0x80; });
+    const u32 bytes = static_cast<u32>(len * (wide ? 2 : 1));
+    u32 offset = cursor.used + (wide ? (cursor.used & 1) : 0); // UTF-16 names stay 2-byte aligned
+    if (offset + bytes > NameChunk)
+    {
+        const u32 c = m_nameChunks.fetch_add(1, std::memory_order_relaxed);
+        m_names[c].store(new BYTE[NameChunk], std::memory_order_release);
+        cursor = { c, 0 };
+        offset = 0;
+    }
+    BYTE* dst = m_names[cursor.chunk].load(std::memory_order_relaxed) + offset;
+    if (wide) memcpy(dst, name, bytes);
+    else for (size_t i = 0; i < len; ++i) dst[i] = static_cast<BYTE>(name[i]);
+    cursor.used = offset + bytes;
+    node.name = cursor.chunk * NameChunk + offset;
+    node.nameLen = static_cast<unsigned short>(len);
+    node.nameWide = wide ? 1 : 0;
+}
+
+bool ScanTree::NameEquals(const Node& node, const std::wstring& s) const
+{
+    if (node.nameLen != s.size()) return false;
+    const BYTE* p = NameBytes(node.name);
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        const wchar_t c = node.nameWide ? reinterpret_cast<const wchar_t*>(p)[i] : static_cast<wchar_t>(p[i]);
+        if (towlower(c) != towlower(s[i])) return false;
+    }
+    return true;
+}
+
+void ScanTree::InitNode(const u32 index, const u32 parent, NameCursor& cursor, const wchar_t* name, const size_t len)
+{
     Node& node = At(index);
     node = Node();
     node.parent = parent;
-    node.nameLen = static_cast<unsigned short>(std::min<size_t>(len, 0xFFFF));
-    node.name = AddName(name, node.nameLen);
+    SetName(node, cursor, name, std::min<size_t>(len, 0xFFFF));
     if (parent != NoNode)
     {
         node.nextSibling = At(parent).firstChild;
         At(parent).firstChild = index;
     }
-    return index;
 }
 
 std::wstring ScanTree::Name(const u32 i) const
 {
-    return std::wstring(NamePtr(At(i).name), At(i).nameLen);
+    const Node& n = At(i);
+    const BYTE* p = NameBytes(n.name);
+    if (n.nameWide) return std::wstring(reinterpret_cast<const wchar_t*>(p), n.nameLen);
+    return std::wstring(p, p + n.nameLen);
 }
 
 std::wstring ScanTree::Path(const u32 i) const
@@ -86,10 +260,9 @@ void ScanTree::Detach(const u32 i)
 
 u32 ScanTree::Find(const std::wstring& path) const
 {
-    std::wstring rest = path;
-    std::wstring rootName = Name(0);
-    if (rest.size() < rootName.size() || _wcsnicmp(rest.c_str(), rootName.c_str(), rootName.size()) != 0) return NoNode;
-    rest = rest.substr(rootName.size());
+    const std::wstring rootName = Name(0);
+    if (path.size() < rootName.size() || _wcsnicmp(path.c_str(), rootName.c_str(), rootName.size()) != 0) return NoNode;
+    const std::wstring rest = path.substr(rootName.size());
     u32 cur = 0;
     size_t pos = 0;
     while (pos < rest.size())
@@ -101,7 +274,7 @@ u32 ScanTree::Find(const std::wstring& path) const
         u32 next = NoNode;
         for (u32 c = At(cur).firstChild; c != NoNode; c = At(c).nextSibling)
         {
-            if (At(c).nameLen == part.size() && _wcsnicmp(NamePtr(At(c).name), part.c_str(), part.size()) == 0)
+            if (NameEquals(At(c), part))
             {
                 next = c;
                 break;
@@ -117,8 +290,8 @@ u32 ScanTree::Find(const std::wstring& path) const
 
 u64 ScanTree::MemoryUsed() const
 {
-    return static_cast<u64>(m_nodes.size()) * (NodeMask + 1) * sizeof(Node) +
-        static_cast<u64>(m_names.size()) * NameChunk * sizeof(wchar_t);
+    return static_cast<u64>(m_nodeChunks.load(std::memory_order_relaxed)) * (NodeMask + 1) * sizeof(Node) +
+        static_cast<u64>(m_nameChunks.load(std::memory_order_relaxed)) * NameChunk;
 }
 
 // --- Scanner -------------------------------------------------------------------
@@ -126,53 +299,54 @@ u64 ScanTree::MemoryUsed() const
 Scanner::~Scanner()
 {
     Cancel();
-    if (m_thread.valid()) WaitForSingleObject(m_thread.h, INFINITE);
+    if (m_thread.joinable()) m_thread.join();
 }
 
 bool Scanner::Start(const ScanOptions& options, HWND notify, UINT doneMessage)
 {
     if (Running()) return false;
+    if (m_thread.joinable()) m_thread.join();
     m_options = options;
     m_notify = notify;
     m_doneMessage = doneMessage;
     m_cancel = false;
-    m_progress = ScanProgress();
+    m_files = m_dirs = m_bytes = 0;
+    m_queue.clear();
+    m_busy = 0;
+    m_topNames.clear();
+    m_topBytes.reset();
     m_tree.reset(new ScanTree(options.root));
-    m_thread.reset(CreateThread(nullptr, 256 * 1024, ThreadMain, this, 0, nullptr));
-    return m_thread.valid();
+    m_running = true;
+    m_thread = std::thread([this] { Run(); });
+    return true;
 }
 
 ScanProgress Scanner::Progress()
 {
-    SrwGuard guard(&m_lock);
-    return m_progress;
+    ScanProgress p;
+    p.files = m_files.load(std::memory_order_relaxed);
+    p.dirs = m_dirs.load(std::memory_order_relaxed);
+    p.bytes = m_bytes.load(std::memory_order_relaxed);
+    std::lock_guard<std::mutex> guard(m_pathLock);
+    p.currentPath = m_currentPath;
+    if (m_topBytes)
+    {
+        p.topLevel.reserve(m_topNames.size());
+        for (size_t i = 0; i < m_topNames.size(); ++i)
+            p.topLevel.push_back({ m_topNames[i], m_topBytes[i].load(std::memory_order_relaxed) });
+        std::sort(p.topLevel.begin(), p.topLevel.end(), [](const auto& a, const auto& b) { return a.bytes > b.bytes; });
+    }
+    return p;
 }
 
 std::unique_ptr<ScanTree> Scanner::TakeResult()
 {
-    if (m_thread.valid()) WaitForSingleObject(m_thread.h, INFINITE);
+    if (m_thread.joinable()) m_thread.join();
     return std::move(m_tree);
 }
 
-DWORD WINAPI Scanner::ThreadMain(LPVOID self)
-{
-    static_cast<Scanner*>(self)->Run();
-    return 0;
-}
-
-typedef BOOL (WINAPI* Wow64DisableFn)(PVOID*);
-
 void Scanner::Run()
 {
-    // A 32-bit build would otherwise see SysWOW64 instead of System32.
-    PVOID wowState = nullptr;
-    if (auto fn = reinterpret_cast<Wow64DisableFn>(
-        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "Wow64DisableWow64FsRedirection")))
-    {
-        fn(&wowState);
-    }
-    if (m_options.lowPriority) SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
-
     const DWORD start = GetTickCount();
     ScanTree& tree = *m_tree;
 
@@ -186,21 +360,64 @@ void Scanner::Run()
     }
     m_isNtfs = tree.fileSystem == L"NTFS";
 
-    // Depth-first walk with an explicit stack (no recursion -> no stack overflow on deep trees).
-    std::vector<std::pair<u32, std::wstring>> stack;
-    stack.emplace_back(tree.Root(), m_options.root);
-    while (!stack.empty() && !m_cancel)
+    int threads = m_options.threads > 0 ? m_options.threads :
+        static_cast<int>(std::min<unsigned>(std::max(1u, std::thread::hardware_concurrency()), 8u));
+    threads = std::clamp(threads, 1, 16);
+    if (m_options.lowPriority) threads = std::min(threads, 4); // stay gentle on a struggling system
+    tree.threadsUsed = threads;
+
+    // The root folder is enumerated here first, so every top-level child gets a live progress slot.
+    WorkerStats rootStats;
+    std::vector<Work> rootDirs;
+    ScanFolder({ tree.Root(), NoNode, m_options.root }, tree.m_mainCursor, rootStats, rootDirs);
     {
-        std::pair<u32, std::wstring> top = std::move(stack.back());
-        stack.pop_back();
-        const u32 firstNew = tree.Count();
-        ScanFolder(top.first, top.second);
-        for (u32 c = tree.At(top.first).firstChild; c != NoNode; c = tree.At(c).nextSibling)
-        {
-            if (c >= firstNew && (tree.At(c).flags & (NF_DIR | NF_REPARSE)) == NF_DIR)
-                stack.emplace_back(c, JoinPath(top.second, tree.Name(c)));
-        }
+        std::lock_guard<std::mutex> guard(m_qLock);
+        m_queue = std::move(rootDirs);
     }
+
+    std::vector<std::thread> workers;
+    std::vector<WorkerStats> stats(static_cast<size_t>(threads));
+    for (int i = 0; i < threads; ++i)
+        workers.emplace_back([this, i, &stats] {
+            if (m_options.lowPriority) SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+            ScanTree::NameCursor cursor;
+            std::vector<Work> subdirs;
+            for (;;)
+            {
+                Work work;
+                {
+                    std::unique_lock<std::mutex> lock(m_qLock);
+                    m_cv.wait(lock, [this] { return m_cancel || !m_queue.empty() || m_busy == 0; });
+                    if (m_cancel || m_queue.empty()) break;
+                    work = std::move(m_queue.back());
+                    m_queue.pop_back();
+                    ++m_busy;
+                }
+                subdirs.clear();
+                ScanFolder(work, cursor, stats[static_cast<size_t>(i)], subdirs);
+                {
+                    std::lock_guard<std::mutex> lock(m_qLock);
+                    for (Work& w : subdirs) m_queue.push_back(std::move(w));
+                    --m_busy;
+                }
+                m_cv.notify_all();
+            }
+            m_cv.notify_all();
+        });
+    for (std::thread& t : workers) t.join();
+
+    for (const WorkerStats& s : stats)
+    {
+        rootStats.files += s.files;
+        rootStats.dirs += s.dirs;
+        rootStats.folded += s.folded;
+        rootStats.errors += s.errors;
+    }
+    tree.fileCount = rootStats.files;
+    tree.dirCount = rootStats.dirs;
+    tree.foldedFiles = rootStats.folded;
+    tree.errorCount = rootStats.errors;
+    tree.budgetHit = rootStats.folded > 0;
 
     // Roll sizes up: children always have larger indexes than their parent.
     for (u32 i = tree.Count(); i-- > 1;)
@@ -217,125 +434,126 @@ void Scanner::Run()
     tree.cancelled = m_cancel;
     tree.scanMillis = GetTickCount() - start;
     tree.peakWorkingSet = PeakWorkingSet();
-    if (m_options.lowPriority) SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+    m_running = false;
     if (m_notify) PostMessageW(m_notify, m_doneMessage, 0, 0);
 }
 
-u64 Scanner::AllocatedSize(const std::wstring& path, const WIN32_FIND_DATAW& fd) const
-{
-    const u64 size = (static_cast<u64>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
-    if (fd.dwFileAttributes & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)) return 0;
-    if (fd.dwFileAttributes & (FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_SPARSE_FILE))
-    {
-        DWORD high = 0;
-        const DWORD low = GetCompressedFileSizeW(LongPath(path).c_str(), &high);
-        if (low != INVALID_FILE_SIZE || GetLastError() == NO_ERROR) return (static_cast<u64>(high) << 32) | low;
-    }
-    // Tiny NTFS files live inside their MFT record and use no clusters.
-    if (m_isNtfs && size < 700) return 0;
-    const u64 cluster = m_tree->clusterSize ? m_tree->clusterSize : 4096;
-    return (size + cluster - 1) / cluster * cluster;
-}
-
-void Scanner::ScanFolder(const u32 dir, std::wstring& path)
+void Scanner::ScanFolder(const Work& work, ScanTree::NameCursor& cursor, WorkerStats& stats, std::vector<Work>& subdirs)
 {
     ScanTree& tree = *m_tree;
-    {
-        SrwGuard guard(&m_lock);
-        m_progress.currentPath = path;
-    }
+    if (std::unique_lock<std::mutex> lock(m_pathLock, std::try_to_lock); lock.owns_lock()) m_currentPath = work.path;
 
-    WIN32_FIND_DATAW fd;
-    const std::wstring pattern = LongPath(JoinPath(path, L"*"));
-    HANDLE find = FindFirstFileExW(pattern.c_str(), FindExInfoStandard, &fd, FindExSearchNameMatch, nullptr,
-        FIND_FIRST_EX_LARGE_FETCH);
-    if (find == INVALID_HANDLE_VALUE)
+    if (const DWORD error = Enumerate(work.path); error != ERROR_SUCCESS)
     {
-        const DWORD error = GetLastError();
-        if (error != ERROR_FILE_NOT_FOUND)
-        {
-            tree.At(dir).flags |= NF_ERROR;
-            ++tree.errorCount;
-        }
+        tree.At(work.dir).flags |= NF_ERROR;
+        ++stats.errors;
         return;
     }
+    const Scratch& s = t_scratch;
+    if (s.entries.empty()) return;
 
-    u32 aggregate = NoNode;
+    // Decide folding first, so the folder's nodes can be reserved in one contiguous block.
+    const bool overBudget = m_options.memoryBudget && tree.MemoryUsed() >= m_options.memoryBudget;
+    size_t keep = 0, folded = 0;
+    for (const Entry& e : s.entries)
+    {
+        const bool dir = (e.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (!dir && overBudget && e.size < m_options.foldThreshold) ++folded;
+        else ++keep;
+    }
+    const u32 first = tree.ReserveNodes(static_cast<u32>(keep + (folded ? 1 : 0)));
+    const bool isRoot = work.dir == tree.Root();
+    if (isRoot)
+    {
+        std::lock_guard<std::mutex> guard(m_pathLock);
+        m_topNames.clear();
+        m_topBytes.reset(new std::atomic<u64>[s.entries.size() + 1]());
+    }
+
+    u32 next = first;
     u64 files = 0, dirs = 0, bytes = 0;
-    do
+    Node* aggregate = nullptr;
+    u32 aggregateIndex = NoNode;
+    for (const Entry& e : s.entries)
     {
-        if (m_cancel) break;
-        const wchar_t* name = fd.cFileName;
-        if (name[0] == L'.' && (name[1] == 0 || (name[1] == L'.' && name[2] == 0))) continue;
-        const size_t len = wcslen(name);
-        const u64 write = Ticks(fd.ftLastWriteTime);
-        const u64 access = Ticks(fd.ftLastAccessTime);
-
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        const wchar_t* name = s.names.data() + e.nameOffset;
+        const bool dir = (e.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (!dir)
         {
-            const u32 n = tree.NewNode(dir, name, len);
-            Node& node = tree.At(n);
-            node.flags = NF_DIR;
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) node.flags |= NF_REPARSE;
-            node.attributes = fd.dwFileAttributes;
-            node.writeTime = write;
-            node.accessTime = access;
-            ++dirs;
-            continue;
+            ++files;
+            bytes += e.size;
         }
 
-        const u64 size = (static_cast<u64>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
-        const u64 alloc = AllocatedSize(JoinPath(path, name), fd);
-        ++files;
-        bytes += size;
-
-        // Memory budget reached: fold small files into one aggregate node per folder.
-        if (m_options.memoryBudget && size < m_options.foldThreshold &&
-            tree.MemoryUsed() >= m_options.memoryBudget)
+        if (!dir && overBudget && e.size < m_options.foldThreshold)
         {
-            tree.budgetHit = true;
-            if (aggregate == NoNode)
+            if (!aggregate)
             {
-                aggregate = tree.NewNode(dir, L"[small files]", 13);
-                tree.At(aggregate).flags = NF_AGGREGATE;
+                aggregateIndex = first + static_cast<u32>(keep);
+                tree.InitNode(aggregateIndex, work.dir, cursor, L"[small files]", 13);
+                aggregate = &tree.At(aggregateIndex);
+                aggregate->flags = NF_AGGREGATE;
             }
-            Node& agg = tree.At(aggregate);
-            agg.size += size;
-            agg.alloc += alloc;
-            agg.files += 1;
-            agg.writeTime = std::max(agg.writeTime, write);
-            agg.accessTime = std::max(agg.accessTime, access);
-            ++tree.foldedFiles;
+            aggregate->size += e.size;
+            aggregate->alloc += e.alloc;
+            aggregate->files += 1;
+            aggregate->writeTime = std::max(aggregate->writeTime, e.writeTime);
+            aggregate->accessTime = std::max(aggregate->accessTime, e.accessTime);
             continue;
         }
 
-        const u32 n = tree.NewNode(dir, name, len);
-        Node& node = tree.At(n);
-        node.size = size;
-        node.alloc = alloc;
+        const u32 index = next++;
+        tree.InitNode(index, work.dir, cursor, name, e.nameLen);
+        Node& node = tree.At(index);
+        node.attributes = e.attributes;
+        node.writeTime = e.writeTime;
+        node.accessTime = e.accessTime;
+
+        u32 top = work.top;
+        if (isRoot)
+        {
+            std::lock_guard<std::mutex> guard(m_pathLock);
+            top = static_cast<u32>(m_topNames.size());
+            m_topNames.emplace_back(name, e.nameLen);
+            if (!dir) m_topBytes[top].store(e.size, std::memory_order_relaxed);
+        }
+
+        if (dir)
+        {
+            ++dirs;
+            node.flags = NF_DIR;
+            if (e.attributes & FILE_ATTRIBUTE_REPARSE_POINT) node.flags |= NF_REPARSE;
+            else subdirs.push_back({ index, top, JoinPath(work.path, std::wstring(name, e.nameLen)) });
+            continue;
+        }
+
+        node.size = e.size;
         node.files = 1;
-        node.attributes = fd.dwFileAttributes;
-        node.writeTime = write;
-        node.accessTime = access;
-        if (fd.dwFileAttributes & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS))
+        node.alloc = e.alloc;
+        if (e.attributes & CloudAttributes)
+        {
             node.flags |= NF_CLOUD;
+            node.alloc = 0;
+        }
+        else if (!LoadNtQuery() && m_isNtfs)
+        {
+            // Fallback enumeration has no allocation size: estimate (tiny files live in the MFT record).
+            const u64 cluster = tree.clusterSize ? tree.clusterSize : 4096;
+            node.alloc = e.size < 700 ? 0 : (e.size + cluster - 1) / cluster * cluster;
+        }
     }
-    while (FindNextFileW(find, &fd));
-    FindClose(find);
 
-    tree.fileCount += files;
-    tree.dirCount += dirs;
-    if (aggregate != NoNode)
+    if (aggregate)
     {
-        const u64 n = tree.At(aggregate).files;
-        const std::wstring label = Fmt(L"[%s small files]", FormatCount(n).c_str());
-        tree.At(aggregate).name = tree.AddName(label.c_str(), label.size());
-        tree.At(aggregate).nameLen = static_cast<unsigned short>(label.size());
+        const std::wstring label = Fmt(L"[%s small files]", FormatCount(aggregate->files).c_str());
+        tree.SetName(*aggregate, cursor, label.c_str(), label.size());
+        stats.folded += folded;
     }
 
-    SrwGuard guard(&m_lock);
-    m_progress.files += files;
-    m_progress.dirs += dirs;
-    m_progress.bytes += bytes;
+    stats.files += files;
+    stats.dirs += dirs;
+    m_files.fetch_add(files, std::memory_order_relaxed);
+    m_dirs.fetch_add(dirs, std::memory_order_relaxed);
+    m_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    if (!isRoot && work.top != NoNode && m_topBytes) m_topBytes[work.top].fetch_add(bytes, std::memory_order_relaxed);
 }
 }
