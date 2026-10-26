@@ -96,6 +96,7 @@ struct App
     float mouseX = 0, mouseY = 0;
     DWORD pageStart = 0, unfoldStart = 0;
     int threads = 0;
+    unsigned scanGen = 0; // bumped by every StartScan: menus/dialogs compare it to detect a replaced tree
 
     // Data
     std::wstring root, volume;
@@ -1147,6 +1148,7 @@ void BuildPalette()
             const u32 n = hits[k];
             g.items.push_back({ t.Name(n), FormatBytes(t.At(n).size) + L"  \u00B7  " + t.Path(t.At(n).parent), t.IsDir(n) ? wchar_t(0xE8B7) : wchar_t(0xE7C3),
                 [n] {
+                    if (!g.tree || n >= g.tree->Count()) return;
                     const ScanTree& tr = *g.tree;
                     g.exploreRoot = tr.IsDir(n) ? n : tr.At(n).parent;
                     g.highlight = tr.IsDir(n) ? NoNode : n;
@@ -1290,7 +1292,7 @@ void Paint(HDC printDc = nullptr)
     DrawPalette(c);
     if (t < 1 || (g.unfoldStart && gfx::Ease(g.unfoldStart, 700, true) < 1)) SetTimer(g.hwnd, TimerAnim, 16, nullptr);
     else KillTimer(g.hwnd, TimerAnim);
-    c.End();
+    if (!c.End()) Invalidate(); // device lost: the canvas dropped its target, repaint
 }
 
 // --- Actions -----------------------------------------------------------------------
@@ -1440,6 +1442,8 @@ void Analyze()
 void StartScan(const std::wstring& root)
 {
     if (g.busy) return;
+    ++g.scanGen;
+    g.palette = false; // its items point into the old tree
     if (g.scanner) g.scanner->Cancel();
     if (g.quick) g.quick->Cancel();
     g.scanner.reset();
@@ -1451,6 +1455,7 @@ void StartScan(const std::wstring& root)
     g.kinds.reset();
     g.root = root;
     if (g.root.size() == 2 && g.root[1] == L':') g.root += L'\\';
+    while (g.root.size() > 3 && g.root.back() == static_cast<wchar_t>(92)) g.root.pop_back(); // a trailing backslash would never match Find()
     g.volume = VolumeOf(g.root);
     RefreshVolume();
     g.exploreRoot = 0;
@@ -1483,7 +1488,11 @@ void StartScan(const std::wstring& root)
 
 void OnScanDone()
 {
-    g.tree = g.scanner->TakeResult();
+    // A cancelled scan's WM_SCAN_DONE can arrive after a newer scan started: ignore it (and duplicates).
+    if (!g.scanner || g.scanner->Running()) return;
+    std::unique_ptr<ScanTree> done = g.scanner->TakeResult();
+    if (!done) return;
+    g.tree = std::move(done);
     KillTimer(g.hwnd, TimerProgress);
     if (g.tree->fileCount == 0 && g.tree->errorCount)
         ShowToast(L"Couldn't read " + g.root + L". Check that it exists and you have access.", -1, true);
@@ -1547,6 +1556,7 @@ void RunAction(ActionKind kind)
     for (const ReviewItem& it : g.review)
         if (it.checked && !it.locked) { paths.push_back(g.tree->Path(it.node)); nodes.push_back(it.node); bytes += g.tree->At(it.node).size; }
     if (paths.empty() || g.busy) return;
+    const unsigned gen = g.scanGen;
     const std::wstring work = PickWorkVolume(g.volume, Settings::Get().rescue);
     std::wstring what;
     switch (kind)
@@ -1565,6 +1575,7 @@ void RunAction(ActionKind kind)
     if (kind == ActionKind::DeletePermanent &&
         MessageBoxW(g.hwnd, L"Are you sure? These files will be gone for good.", L"SpaceRescue", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
         return;
+    if (g.busy || g.scanning || gen != g.scanGen) return; // a rescan replaced the tree while the dialogs were open
     g.busy = true;
     if (g.worker.joinable()) g.worker.join();
     g.worker = std::thread([kind, paths, nodes, work] {
@@ -1581,10 +1592,16 @@ void OnActionDone(std::pair<ActionResult, std::vector<u32>>* res)
     // Remove what was handled from the tree (compress keeps files in place).
     if (r.kind != ActionKind::Compress)
     {
+        std::vector<char> gone(g.tree->Count(), 0);
         for (size_t i = 0; i < res->second.size(); ++i)
         {
-            const std::wstring path = g.tree->Path(res->second[i]);
-            if (std::find(r.done.begin(), r.done.end(), path) != r.done.end()) g.tree->Detach(res->second[i]);
+            const u32 node = res->second[i];
+            const std::wstring path = g.tree->Path(node);
+            if (std::find(r.done.begin(), r.done.end(), path) == r.done.end()) continue;
+            bool covered = false; // an ancestor was already detached: its size included this node
+            for (u32 p = g.tree->At(node).parent; p != NoNode; p = g.tree->At(p).parent) if (gone[p]) { covered = true; break; }
+            gone[node] = 1;
+            if (!covered) g.tree->Detach(node);
         }
         g.review.erase(std::remove_if(g.review.begin(), g.review.end(), [&](const ReviewItem& it) {
             return std::find(r.done.begin(), r.done.end(), g.tree->Path(it.node)) != r.done.end(); }), g.review.end());
@@ -1705,10 +1722,11 @@ void NodeMenu(u32 node)
 {
     if (!g.tree || node == NoNode || node >= g.tree->Count()) return;
     const ScanTree& t = *g.tree;
+    const unsigned gen = g.scanGen;
     const bool dir = t.IsDir(node);
     const bool aggregate = (t.At(node).flags & NF_AGGREGATE) != 0;
     const std::wstring path = aggregate ? t.Path(t.At(node).parent) : t.Path(node);
-    const bool locked = IsProtectedPath(path) || aggregate;
+    const bool locked = IsProtectedPath(path) || aggregate || node == t.Root();
     enum { Open = 1, OpenExplorer, ShowExplore, ShowMap, Prompt, Props, CopyPath, CopyName, Review, Recycle, Layout, ExpandAll };
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING | MF_DEFAULT, Open, dir ? L"Open\tDouble-click" : L"Open with default app\tDouble-click");
@@ -1730,6 +1748,7 @@ void NodeMenu(u32 node)
     SetForegroundWindow(g.hwnd);
     const UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g.hwnd, nullptr);
     DestroyMenu(menu);
+    if (gen != g.scanGen || !g.tree || g.scanning) return; // the tree was replaced while the menu was open
     switch (cmd)
     {
     case Open: OpenNode(node); break;
@@ -1787,6 +1806,7 @@ bool GoToPath(std::wstring path)
 
 void RunSystemTool(size_t i)
 {
+    if (!g.system || i >= g.system->items.size()) return;
     const SystemItem& it = g.system->items[i];
     const std::wstring& cmd = it.command;
     std::wstring confirm = it.tool + L"\n\nSpaceRescue will run:\n" + cmd;
@@ -2104,6 +2124,13 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_PRINTCLIENT:
         Paint(reinterpret_cast<HDC>(wp));
         return 0;
+    case WM_GETMINMAXINFO:
+    {
+        const UINT dpi = GetDpiForWindow(hwnd);
+        const float sc = static_cast<float>(dpi ? dpi : 96) / 96.0f;
+        reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize = { static_cast<LONG>(900 * sc), static_cast<LONG>(600 * sc) };
+        return 0;
+    }
     case WM_SIZE:
         g.canvas.Resize(LOWORD(lp), HIWORD(lp));
         Invalidate();
@@ -2262,7 +2289,7 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (g.highlight != NoNode)
         {
             if (ctrl && wp == 'C') { CopyText(g.tree->Path(g.highlight), L"Path copied."); return 0; }
-            if (wp == VK_DELETE) { OpenReview(g.tree->Name(g.highlight), { { g.highlight, L"Chosen by you", Safety::Review, true, false } }); return 0; }
+            if (wp == VK_DELETE && g.highlight != g.tree->Root() && !(g.tree->At(g.highlight).flags & NF_AGGREGATE)) { OpenReview(g.tree->Name(g.highlight), { { g.highlight, L"Chosen by you", Safety::Review, true, false } }); return 0; }
             if (wp == VK_RETURN) { OpenNode(g.highlight); return 0; }
         }
         // Explore keyboard navigation (WinDirStat-style tree).
