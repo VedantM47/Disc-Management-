@@ -14,10 +14,10 @@
 #define _UNICODE
 #endif
 #ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0601
+#define _WIN32_WINNT 0x0A00 // Windows 10+ APIs (GetDpiForWindow etc.)
 #endif
 #ifndef WINVER
-#define WINVER 0x0601
+#define WINVER 0x0A00
 #endif
 #define NOMINMAX
 
