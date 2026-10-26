@@ -6,6 +6,7 @@
 #include "ui/ui_common.h"
 #include "ui/app_window.h"
 #include "rescue/setup.h"
+#include "ui2/preview.h"
 
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show)
 {
@@ -13,6 +14,14 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show)
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     int exitCode = 0;
     std::wstring scanPath;
+    // Phase D design preview of the new UI (see DESIGN.md).
+    if (sr::ui2::PreviewOptions preview; argv && sr::ui2::ParsePreviewArgs(argc, argv, &preview))
+    {
+        LocalFree(argv);
+        sr::Settings::Get().Load();
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        return sr::ui2::RunPreview(instance, show, preview);
+    }
     if (argv && sr::HandleCommandLine(argc, argv, &exitCode, &scanPath))
     {
         LocalFree(argv);
