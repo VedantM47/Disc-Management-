@@ -4,6 +4,7 @@
 
 #include "../gfx/gfx.h"
 #include "../insights/insights.h"
+#include "../insights/quickwins.h"
 #include "../internals/internals.h"
 #include "../notify/tray.h"
 #include "../rescue/rescue.h"
@@ -54,6 +55,8 @@ struct App
     std::wstring volume;
     u64 volTotal = 0, volFree = 0;
     std::unique_ptr<Scanner> scanner;
+    std::unique_ptr<QuickWins> quick;
+    DWORD scanStart = 0;
     std::unique_ptr<ScanTree> tree;
     std::unique_ptr<InsightsReport> report;
     std::unique_ptr<viz::KindModel> kinds;
@@ -817,8 +820,29 @@ void PageSettings(Canvas& c, const D2D1_RECT_F& area)
 void DrawScanning(Canvas& c, const D2D1_RECT_F& area)
 {
     const ScanProgress p = g.scanner ? g.scanner->Progress() : ScanProgress();
-    const float w = std::min(760.0f, area.right - area.left);
-    const float x = area.left + (area.right - area.left - w) / 2;
+    // Quick wins (right column): sized in parallel, answer within seconds.
+    const float qw = 320;
+    const float w = std::min(700.0f, area.right - area.left - qw - 40);
+    const float x = area.left + (area.right - area.left - w - qw - 40) / 2;
+    if (g.quick)
+    {
+        const float qx = x + w + 40;
+        const D2D1_RECT_F card = Rect(qx, area.top + 40, qw, 420);
+        c.Card(card, 16);
+        Overline(c, L"Quick wins found so far", qx + 20, card.top + 18, qw - 40);
+        c.Text(FormatBytes(g.quick->SafeTotal()), Rect(qx + 20, card.top + 36, qw - 40, 40), Text::Number, P().safe);
+        c.Text(Fmt(L"safe to free · %.1f s", (GetTickCount() - g.scanStart) / 1000.0), Rect(qx + 20, card.top + 70, qw - 40, 18),
+            Text::Caption, P().textDim);
+        float qy = card.top + 100;
+        for (const QuickWin& q : g.quick->Snapshot())
+        {
+            if (qy + 26 > card.bottom - 8 || !q.bytes) continue;
+            c.Circle(qx + 24, qy + 11, 3.5f, q.safe ? P().safe : P().review);
+            c.Text(q.label, Rect(qx + 34, qy, qw - 150, 22), Text::Body, q.done ? P().text : P().textDim, Align::Left, true);
+            c.Text(FormatBytes(q.bytes), Rect(qx + qw - 120, qy, 100, 22), Text::Body, P().textDim, Align::Right, true);
+            qy += 28;
+        }
+    }
     float y = area.top + 40;
     Overline(c, L"Scanning " + g.root, x, y, w);
     c.Text(FormatCount(p.files) + L" files · " + FormatBytes(p.bytes), Rect(x, y + 20, w, 56), Text::Hero, P().text);
@@ -840,10 +864,10 @@ void DrawScanning(Canvas& c, const D2D1_RECT_F& area)
     c.Text(p.currentPath, Rect(x, area.bottom - 30, w, 18), Text::Caption, P().textFaint);
 }
 
-void Paint()
+void Paint(HDC printDc = nullptr)
 {
     Canvas& c = g.canvas;
-    if (!c.Begin(g.hwnd, P())) return;
+    if (printDc ? !c.BeginPrint(g.hwnd, printDc, P()) : !c.Begin(g.hwnd, P())) return;
     g.hots.clear();
     c.Clear(P().base);
     DrawRail(c);
@@ -897,6 +921,12 @@ void StartScan()
     ScanOptions o;
     o.root = g.root;
     g.scanner->Start(o, g.hwnd, WM_SCAN_DONE);
+    g.scanStart = GetTickCount();
+    if (g.root.size() <= 3)
+    {
+        g.quick = std::make_unique<QuickWins>();
+        g.quick->Start(g.volume);
+    }
     SetTimer(g.hwnd, TimerProgress, 100, nullptr);
 }
 
@@ -943,6 +973,9 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         EndPaint(hwnd, &ps);
         return 0;
     }
+    case WM_PRINTCLIENT:
+        Paint(reinterpret_cast<HDC>(wp));
+        return 0;
     case WM_SIZE:
         g.canvas.Resize(LOWORD(lp), HIWORD(lp));
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -955,6 +988,40 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_TIMER:
+        if (wp == 99) // SR_SNAPSHOT: render this frame into a BMP (docs screenshots without screen capture)
+        {
+            KillTimer(hwnd, 99);
+            wchar_t spec[MAX_PATH] = {};
+            GetEnvironmentVariableW(L"SR_SNAPSHOT", spec, MAX_PATH);
+            std::wstring file = spec;
+            file = file.substr(0, file.find(L';'));
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            HDC screen = GetDC(hwnd);
+            HDC mem = CreateCompatibleDC(screen);
+            BITMAPINFO bi = {};
+            bi.bmiHeader = { sizeof(BITMAPINFOHEADER), rc.right, -rc.bottom, 1, 32, BI_RGB };
+            void* bits = nullptr;
+            HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+            HGDIOBJ old = SelectObject(mem, dib);
+            Paint(mem);
+            GdiFlush();
+            BITMAPFILEHEADER fh = { 0x4D42, 0, 0, 0, sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) };
+            const DWORD bytes = static_cast<DWORD>(rc.right) * rc.bottom * 4;
+            fh.bfSize = fh.bfOffBits + bytes;
+            if (FILE* f = _wfopen(file.c_str(), L"wb"))
+            {
+                fwrite(&fh, sizeof fh, 1, f);
+                fwrite(&bi.bmiHeader, sizeof bi.bmiHeader, 1, f);
+                fwrite(bits, bytes, 1, f);
+                fclose(f);
+            }
+            SelectObject(mem, old);
+            DeleteObject(dib);
+            DeleteDC(mem);
+            ReleaseDC(hwnd, screen);
+            return 0;
+        }
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     case WM_SCAN_DONE:
@@ -1096,6 +1163,11 @@ int RunPreview(const HINSTANCE instance, const int show, const PreviewOptions& o
     DwmSetWindowAttribute(g.hwnd, 38 /* DWMWA_SYSTEMBACKDROP_TYPE */, &backdrop, sizeof backdrop);
     ShowWindow(g.hwnd, show);
     StartScan();
+    if (wchar_t spec[MAX_PATH]; GetEnvironmentVariableW(L"SR_SNAPSHOT", spec, MAX_PATH))
+    {
+        const wchar_t* ms = wcschr(spec, L';');
+        SetTimer(g.hwnd, 99, ms ? static_cast<UINT>(_wtoi(ms + 1)) : 3000, nullptr);
+    }
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0)

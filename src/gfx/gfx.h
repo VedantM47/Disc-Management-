@@ -73,6 +73,8 @@ class Canvas
 public:
     // Creates device resources for `hwnd` on first use; call inside WM_PAINT.
     bool Begin(HWND hwnd, const Palette& palette);
+    // Renders into a GDI DC instead (WM_PRINTCLIENT / PrintWindow). End() switches back.
+    bool BeginPrint(HWND hwnd, HDC hdc, const Palette& palette);
     // Returns false if the device was lost (the caller just repaints).
     bool End();
     void Resize(UINT width, UINT height);
@@ -116,7 +118,9 @@ private:
     IDWriteTextFormat* Format(gfx::Text style);
 
     HWND m_hwnd = nullptr;
-    ID2D1HwndRenderTarget* m_target = nullptr;
+    ID2D1HwndRenderTarget* m_hwndTarget = nullptr;
+    ID2D1DCRenderTarget* m_dcTarget = nullptr;
+    ID2D1RenderTarget* m_target = nullptr;   // the one being drawn to
     ID2D1SolidColorBrush* m_brush = nullptr;
     const Palette* m_palette = nullptr;
     D2D1_SIZE_F m_size = { 0, 0 };

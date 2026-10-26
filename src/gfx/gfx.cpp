@@ -216,10 +216,36 @@ const wchar_t* KindLabel(FileKind k)
 
 // --- Canvas ----------------------------------------------------------------------
 
+bool Canvas::BeginPrint(HWND hwnd, HDC hdc, const Palette& palette)
+{
+    // WM_PRINTCLIENT (PrintWindow, screenshots, magnifiers): draw the same frame into a GDI DC.
+    m_palette = &palette;
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    const UINT dpi = GetDpiForWindow(hwnd);
+    const float fdpi = static_cast<float>(dpi ? dpi : 96);
+    if (!m_dcTarget)
+    {
+        const D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), fdpi, fdpi);
+        if (FAILED(Factory()->CreateDCRenderTarget(&props, &m_dcTarget))) return false;
+        m_dcTarget->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    }
+    if (FAILED(m_dcTarget->BindDC(hdc, &rc))) return false;
+    m_dcTarget->SetDpi(fdpi, fdpi);
+    SafeRelease(m_brush);
+    m_target = m_dcTarget;
+    m_target->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0), &m_brush);
+    m_size = m_target->GetSize();
+    m_target->BeginDraw();
+    m_target->SetTransform(D2D1::Matrix3x2F::Identity());
+    return true;
+}
+
 bool Canvas::Begin(HWND hwnd, const Palette& palette)
 {
     m_palette = &palette;
-    if (!m_target || m_hwnd != hwnd)
+    if (!m_hwndTarget || m_hwnd != hwnd)
     {
         Discard();
         m_hwnd = hwnd;
@@ -230,19 +256,21 @@ bool Canvas::Begin(HWND hwnd, const Palette& palette)
         D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), m_dpi, m_dpi);
         if (FAILED(Factory()->CreateHwndRenderTarget(props,
-            D2D1::HwndRenderTargetProperties(hwnd, D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top)), &m_target)))
+            D2D1::HwndRenderTargetProperties(hwnd, D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top)), &m_hwndTarget)))
             return false;
-        m_target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        m_hwndTarget->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        m_target = m_hwndTarget;
         m_target->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0), &m_brush);
     }
     const UINT dpi = GetDpiForWindow(hwnd);
     if (dpi && static_cast<float>(dpi) != m_dpi)
     {
         m_dpi = static_cast<float>(dpi);
-        m_target->SetDpi(m_dpi, m_dpi);
+        m_hwndTarget->SetDpi(m_dpi, m_dpi);
         for (auto& f : m_formats) f.second->Release();
         m_formats.clear();
     }
+    m_target = m_hwndTarget;
     m_size = m_target->GetSize();
     m_target->BeginDraw();
     m_target->SetTransform(D2D1::Matrix3x2F::Identity());
@@ -252,6 +280,14 @@ bool Canvas::Begin(HWND hwnd, const Palette& palette)
 bool Canvas::End()
 {
     const HRESULT hr = m_target->EndDraw();
+    if (m_target == m_dcTarget)
+    {
+        // Back to the window target after a WM_PRINTCLIENT render.
+        SafeRelease(m_brush);
+        m_target = m_hwndTarget;
+        if (m_target) m_target->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0), &m_brush);
+        return SUCCEEDED(hr);
+    }
     if (hr == static_cast<HRESULT>(D2DERR_RECREATE_TARGET))
     {
         Discard();
@@ -262,13 +298,15 @@ bool Canvas::End()
 
 void Canvas::Resize(const UINT width, const UINT height)
 {
-    if (m_target) m_target->Resize(D2D1::SizeU(width, height));
+    if (m_hwndTarget) m_hwndTarget->Resize(D2D1::SizeU(width, height));
 }
 
 void Canvas::Discard()
 {
     SafeRelease(m_brush);
-    SafeRelease(m_target);
+    SafeRelease(m_hwndTarget);
+    SafeRelease(m_dcTarget);
+    m_target = nullptr;
     for (auto& f : m_formats) f.second->Release();
     m_formats.clear();
 }
