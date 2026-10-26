@@ -362,6 +362,30 @@ notes(s, "We designed the flow from the user's side. First they notice, through 
          "Then they act, but only through a review list with confirmation and undo, never a one-click delete from the dashboard. "
          "Finally they stay safe: the reserve file can be re-created and the next alert re-arms only after space recovers.")
 
+# 8b. Our solution: each problem mapped to how SpaceRescue answers it
+s = base(title="Our solution")
+sol = [("", "The tool needs space and RAM", "", "Zero-write Rescue Mode + 512 MB reserve file"),
+       ("", "Scanning takes minutes", "", "8-thread scan of C: in 8.2 s; first answer in 3 s"),
+       ("", "Nothing says what is safe", "", "Safety badges, review list, quarantine and undo"),
+       ("", "System files look scary", "", "Lock badge + safe Windows tool, never Delete"),
+       ("", "No warning until it’s full", "", "Tray alerts at 50, 20, 10, 5, 3, 2, 1 GB, 512 MB")]
+text(s, 0.5, 1.02, 3.6, 0.3, "PROBLEM", size=13, color=RED, bold=True)
+text(s, 4.55, 1.02, 4.9, 0.3, "SPACERESCUE", size=13, color=TEAL, bold=True)
+for i, (g1, prob, g2, ans) in enumerate(sol):
+    y = 1.32 + i * 0.6
+    card(s, 0.5, y, 3.6, 0.5)
+    icon(s, 0.58, y + 0.06, g1, RED, 0.38)
+    text(s, 1.05, y, 3.0, 0.5, prob, size=16, bold=True, anchor=MSO_ANCHOR.MIDDLE)
+    line(s, 4.13, y + 0.25, 4.5, y + 0.25, ORANGE, 2.5)
+    rect(s, 4.55, y, 4.95, 0.5, NAVY)
+    icon(s, 4.63, y + 0.06, g2, TEAL, 0.38)
+    text(s, 5.1, y, 4.3, 0.5, ans, size=16, color=WHITE, anchor=MSO_ANCHOR.MIDDLE)
+strip(s, 4.4, "One tool, one flow:", "notice → understand → act safely → stay safe.")
+notes(s, "This is our answer to every problem we raised. Because the tool itself needs space and memory, Rescue Mode writes nothing to the full drive "
+         "and can hand back a 512 MB reserve file instantly. Because scanning took minutes, the scanner now uses eight threads and finishes C: in 8.2 seconds, "
+         "with a first answer after three seconds. Because users don't know what is safe, every item carries a safety badge and every action can be undone. "
+         "System files get a lock and the Windows tool that shrinks them safely, and tray alerts warn long before the disk is full.")
+
 # 9. Objectives
 s = base(title="Objectives")
 objs = [(1, "Rescue", "Work at 0 bytes free: zero writes to the full drive"),
