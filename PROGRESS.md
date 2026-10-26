@@ -56,6 +56,27 @@ Possible speed-up later: multi-threaded enumeration (upstream uses a work queue)
 - [ ] Cold-cache and MFT (elevated) timings: not run yet (needs a reboot or admin)
 - [ ] Quick-win pre-scan + streaming UI
 
+## Revamp – Phase G: low-space notifications (done early: engine only, no UI dependency)
+- [x] `SpaceRescue.exe /tray`: hidden window + tray icon, 30 s `GetDiskFreeSpaceEx` poll, `WM_DEVICECHANGE`, `TaskbarCreated` re-add, single instance
+- [x] Thresholds 50/20/10/5/3/2/1 GB + 512 MB, downward-only, 10% hysteresis (`AlertLevel`). **11/11 headless tests pass** (scratch test exe)
+- [x] Tone: quiet (no sound) above 10 GB, warning at 5 GB and below, "almost full + Rescue Mode" at 1 GB and below; adds a quick temp/cache estimate
+- [x] Click opens the app on that drive; `/autostart on|off`; `/install /alerts`; uninstall removes the Run key and closes the watcher
+- [x] Measured: **1.6 MB private memory**, 0.1 MB working set after trim (target under 8 MB)
+- [ ] Real VHDX fill test (needs admin)
+
+## Revamp – Phase D: design system (**waiting for approval**)
+- [x] `DESIGN.md`: tokens (deep neutral + "rescue teal" accent + Safe/Review/Caution/Protected), 10-colour file-type palette, type scale with tabular figures, 4 px grid, radius, elevation, motion, icons, Rescue Mode rules
+- [x] `src/gfx`: Direct2D + DirectWrite layer (DIP-based, per-monitor DPI, text styles, rounded cards with soft shadows, annular sectors, arc meters, pixel blits, eased motion that respects "Animation effects")
+- [x] `src/ui2/preview.cpp`: `SpaceRescue.exe /preview [path] [/light|/dark]`, left nav rail with 8 tabs on real scan data, live streaming scan screen, title bar tinted to the base colour + Mica, Ctrl+1…8
+- [x] Screenshots: `docs/screens/preview-{dark,light}-*.png` (every tab + map modes + live scan)
+
+## Revamp – Phase E: visualisations (components done, built into the preview)
+- [x] Treemap ported from upstream (squarified layout + cushion shading, upstream defaults): **full C: (1.68M files) in 76 ms**
+- [x] Sunburst (Direct2D, grouped small slices, free-space slice, unfold animation, hover tooltip, drill in/out)
+- [x] Flame graph; one file-kind colour model (`BuildKinds`, dominant kind per folder) shared by all three plus the legends
+- [ ] Linked selection with Explore (Phase F, after approval)
+- Note: preview peak RAM is 304–314 MB on C: (scan 260 MB + kind model + analysis). Trim the kind model's temporary per-folder sums in Phase F.
+
 ## Not yet verified
 
 - [ ] Elevated run: MFT stats vs `fsutil fsinfo ntfsinfo`
