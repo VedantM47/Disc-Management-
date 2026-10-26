@@ -43,6 +43,8 @@ const runCmds = [
   [".\\build\\SpaceRescue.exe /tray", "Start the low-space alert in the system tray."],
   [".\\build\\SpaceRescue.exe /classic", "Open the older interface."],
   ["python docs\\build_presentation.py", "Rebuild the slide deck."],
+  ["release\\SpaceRescue-Setup-x64.exe", "Installer to send to anyone: double-click, no admin needed. Uninstall from Settings > Apps."],
+  ["release\\SpaceRescue-portable.zip", "No-install version: unzip and run SpaceRescue.exe (works from a USB stick)."],
 ];
 
 function runTable() {

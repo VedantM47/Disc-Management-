@@ -53,10 +53,10 @@ module.exports = {
     ["Size roll-up", "Weigh small boxes first, then add up.", "Post-order pass, children before parents; O(n).", "scanner.cpp"],
     ["Squarified treemap", "Chocolate pieces kept square, shaded like pillows.", "Rows by worst aspect ratio + cushion shading; whole C: in 76 ms.", "viz.cpp"],
     ["Sunburst", "Pie chart with rings for sub-folders.", "Angle ∝ size per depth ring; tiny slices grouped.", "viz.cpp"],
-    ["Duplicate funnel", "Same height → same face → fingerprints.", "Size groups → 64 KB hash → full hash (FNV-1a).", "insights.cpp"],
+    ["Duplicate funnel", "Same height → same face → fingerprints.", "Same size → hash of first + last 64 KB → full-file hash (FNV-1a).", "insights.cpp"],
     ["Stale-file classifier", "Toys not touched for a year.", "Last access if NTFS updates it, else last write; 6/12/24 months.", "insights.cpp"],
     ["Extent merging", "Touching track pieces are one piece.", "Join runs where next LCN = end of previous (86→24).", "internals.cpp"],
-    ["Top-K largest", "200 tallest kids without sorting everyone.", "std::partial_sort (heap select); O(n log k).", "internals.cpp"],
+    ["Top-K most fragmented", "Find the 200 messiest rooms without ranking every room.", "std::partial_sort over extent counts keeps the top 200; O(n log k).", "internals.cpp"],
     ["Alert hysteresis", "A smoke alarm that beeps once, not every second.", "Fire on downward crossing; re-arm at +10%; 11/11 tests.", "tray.cpp"],
   ],
 };
