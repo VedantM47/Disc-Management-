@@ -1,0 +1,24 @@
+# Directories
+/.git/
+/.vs/
+/publish/
+/contrib/
+/build/
+/enc_temp_folder/
+intermediate/
+
+# File Masks
+*.aps
+*.bin
+*.vcxproj.user
+*.lastcodeanalysissucceeded
+*_combined.txt
+
+# Specific Files
+/windirstat/res/LangStrings.h
+
+# SpaceRescue build output
+/build/
+
+/.claude/
+/CLAUDE.md
