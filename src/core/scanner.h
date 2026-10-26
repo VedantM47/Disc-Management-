@@ -56,6 +56,7 @@ struct ScanOptions
     u64 foldThreshold = 1 * MiB;    // files smaller than this get folded once over budget
     bool lowPriority = false;       // background CPU/IO priority (Rescue Mode)
     int threads = 0;                // 0 = min(logical cores, 8); clamped to 1..16
+    bool useMft = true;             // whole-drive NTFS scans read the MFT directly when elevated
 };
 
 class ScanTree
@@ -80,6 +81,9 @@ public:
     void Detach(u32 i);
     // Finds a node by full path, NoNode if absent.
     u32 Find(const std::wstring& path) const;
+    // Nodes reachable from the root, children before parents. Use this for bottom-up passes:
+    // index order is NOT guaranteed to be parent-first (the MFT scanner indexes by record number).
+    std::vector<u32> PostOrder() const;
 
     // Approximate bytes used by the tree itself.
     u64 MemoryUsed() const;
@@ -95,6 +99,7 @@ public:
     DWORD clusterSize = 4096;
     std::wstring fileSystem;
     int threadsUsed = 1;
+    bool usedMft = false;           // filled by the MFT fast path
     bool cancelled = false;
     bool budgetHit = false;
 
@@ -174,7 +179,9 @@ private:
     };
 
     void Run();
-    void Worker(int id);
+    // MFT fast path (scanner_mft.cpp). Returns false to fall back to directory enumeration.
+    bool ScanMft();
+    static void RollUp(ScanTree& tree);
     void ScanFolder(const Work& work, ScanTree::NameCursor& cursor, WorkerStats& stats, std::vector<Work>& subdirs);
 
     ScanOptions m_options;

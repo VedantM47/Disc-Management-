@@ -31,8 +31,8 @@ KindModel BuildKinds(const ScanTree& tree)
             slot[i] = static_cast<u32>(sums.size());
             sums.push_back({});
         }
-    // Children have larger indexes than parents: one reverse pass propagates sums upward.
-    for (u32 i = n; i-- > 0;)
+    // Post-order (children before parents) propagates sums upward in one pass.
+    for (const u32 i : tree.PostOrder())
     {
         const Node& node = tree.At(i);
         if (node.flags & NF_DIR)

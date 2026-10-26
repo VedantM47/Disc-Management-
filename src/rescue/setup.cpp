@@ -1,6 +1,7 @@
 // SpaceRescue - SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "setup.h"
+#include "../core/bench.h"
 #include "../notify/tray.h"
 #include "rescue.h"
 #include <shlwapi.h>
@@ -245,6 +246,13 @@ bool HandleCommandLine(const int argc, wchar_t** argv, int* exitCode, std::wstri
         if (Is(a, L"tray"))
         {
             *exitCode = RunTray();
+            return true;
+        }
+        if (Is(a, L"bench"))
+        {
+            std::wstring path = i + 1 < argc && !IsSwitch(argv[i + 1]) ? argv[i + 1] : L"";
+            while (!path.empty() && path.back() == L'"') path.pop_back();
+            *exitCode = RunBench(path);
             return true;
         }
         if (Is(a, L"autostart"))

@@ -288,6 +288,42 @@ u32 ScanTree::Find(const std::wstring& path) const
     return cur;
 }
 
+std::vector<u32> ScanTree::PostOrder() const
+{
+    std::vector<u32> order;
+    order.reserve(Count());
+    std::vector<std::pair<u32, u32>> stack{ { Root(), At(Root()).firstChild } }; // node, next child to visit
+    while (!stack.empty())
+    {
+        auto& top = stack.back();
+        if (top.second != NoNode)
+        {
+            const u32 child = top.second;
+            top.second = At(child).nextSibling;
+            stack.push_back({ child, At(child).firstChild });
+            continue;
+        }
+        order.push_back(top.first);
+        stack.pop_back();
+    }
+    return order;
+}
+
+void Scanner::RollUp(ScanTree& tree)
+{
+    for (const u32 i : tree.PostOrder())
+    {
+        const Node& n = tree.At(i);
+        if (n.parent == NoNode) continue;
+        Node& p = tree.At(n.parent);
+        p.size += n.size;
+        p.alloc += n.alloc;
+        p.files += n.files;
+        p.writeTime = std::max(p.writeTime, n.writeTime);
+        p.accessTime = std::max(p.accessTime, n.accessTime);
+    }
+}
+
 u64 ScanTree::MemoryUsed() const
 {
     return static_cast<u64>(m_nodeChunks.load(std::memory_order_relaxed)) * (NodeMask + 1) * sizeof(Node) +
@@ -360,6 +396,18 @@ void Scanner::Run()
     }
     m_isNtfs = tree.fileSystem == L"NTFS";
 
+    // MFT fast path: one sequential read of the file table instead of ~400K directory queries.
+    const bool driveRoot = m_options.root.size() == 3 && m_options.root[1] == L':';
+    if (m_options.useMft && driveRoot && m_isNtfs && IsElevated() && ScanMft())
+    {
+        tree.cancelled = m_cancel;
+        tree.scanMillis = GetTickCount() - start;
+        tree.peakWorkingSet = PeakWorkingSet();
+        m_running = false;
+        if (m_notify) PostMessageW(m_notify, m_doneMessage, 0, 0);
+        return;
+    }
+
     int threads = m_options.threads > 0 ? m_options.threads :
         static_cast<int>(std::min<unsigned>(std::max(1u, std::thread::hardware_concurrency()), 8u));
     threads = std::clamp(threads, 1, 16);
@@ -419,18 +467,7 @@ void Scanner::Run()
     tree.errorCount = rootStats.errors;
     tree.budgetHit = rootStats.folded > 0;
 
-    // Roll sizes up: children always have larger indexes than their parent.
-    for (u32 i = tree.Count(); i-- > 1;)
-    {
-        const Node& n = tree.At(i);
-        Node& p = tree.At(n.parent);
-        p.size += n.size;
-        p.alloc += n.alloc;
-        p.files += n.files;
-        p.writeTime = std::max(p.writeTime, n.writeTime);
-        p.accessTime = std::max(p.accessTime, n.accessTime);
-    }
-
+    RollUp(tree);
     tree.cancelled = m_cancel;
     tree.scanMillis = GetTickCount() - start;
     tree.peakWorkingSet = PeakWorkingSet();

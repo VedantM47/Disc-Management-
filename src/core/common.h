@@ -73,6 +73,8 @@ namespace sr
 {
 using u64 = unsigned long long;
 using u32 = std::uint32_t;
+using u16 = std::uint16_t;
+using u8 = std::uint8_t;
 
 constexpr u64 KiB = 1024ull;
 constexpr u64 MiB = KiB * 1024ull;
