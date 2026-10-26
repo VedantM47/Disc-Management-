@@ -1,6 +1,7 @@
 // SpaceRescue - SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "setup.h"
+#include "../notify/tray.h"
 #include "rescue.h"
 #include <shlwapi.h>
 
@@ -235,11 +236,28 @@ bool HandleCommandLine(const int argc, wchar_t** argv, int* exitCode, std::wstri
 {
     *exitCode = 0;
     bool install = false, uninstall = false, reg = false, unreg = false, quiet = false, reserve = false;
-    bool createReserve = false, removeReserve = false;
+    bool createReserve = false, removeReserve = false, alerts = false;
+    int autostart = -1; // -1 = unchanged, 0 = off, 1 = on
     u64 reserveMB = 0;
     for (int i = 1; i < argc; ++i)
     {
         const wchar_t* a = argv[i];
+        if (Is(a, L"tray"))
+        {
+            *exitCode = RunTray();
+            return true;
+        }
+        if (Is(a, L"autostart"))
+        {
+            autostart = !(i + 1 < argc && _wcsicmp(argv[i + 1], L"off") == 0);
+            if (i + 1 < argc && !IsSwitch(argv[i + 1])) ++i;
+            continue;
+        }
+        if (Is(a, L"alerts"))
+        {
+            alerts = true;
+            continue;
+        }
         if (!IsSwitch(a))
         {
             if (i == 1 && scanPath)
@@ -265,6 +283,12 @@ bool HandleCommandLine(const int argc, wchar_t** argv, int* exitCode, std::wstri
             if (i + 1 < argc && !IsSwitch(argv[i + 1])) reserveMB = _wtoi(argv[++i]);
         }
     }
+    if (autostart >= 0 && !install && !uninstall)
+    {
+        *exitCode = static_cast<int>(SetStartWithWindows(autostart == 1));
+        if (scanPath) scanPath->clear();
+        return true;
+    }
     if (!(install || uninstall || reg || unreg || createReserve || removeReserve))
         return false;
     if (scanPath) scanPath->clear();
@@ -274,10 +298,28 @@ bool HandleCommandLine(const int argc, wchar_t** argv, int* exitCode, std::wstri
     if (install)
     {
         e = Install(reserve);
+        if (e == ERROR_SUCCESS && alerts)
+        {
+            // Point the Run entry at the installed copy and start watching right away.
+            const std::wstring installed = JoinPath(KnownFolder(CSIDL_LOCAL_APPDATA), L"Programs\\SpaceRescue\\SpaceRescue.exe");
+            const std::wstring cmd = L"\"" + installed + L"\" /tray";
+            HKEY key = nullptr;
+            if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, nullptr, 0,
+                KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS)
+            {
+                RegSetValueExW(key, L"SpaceRescue", 0, REG_SZ, reinterpret_cast<const BYTE*>(cmd.c_str()),
+                    static_cast<DWORD>((cmd.size() + 1) * sizeof(wchar_t)));
+                RegCloseKey(key);
+            }
+            ShellExecuteW(nullptr, L"open", installed.c_str(), L"/tray", nullptr, SW_HIDE);
+        }
         ok = L"SpaceRescue was installed for your account.\r\n\r\nRight-click a folder or drive in Explorer and choose \"Analyze with SpaceRescue\" (on Windows 11: Show more options).";
     }
     else if (uninstall)
     {
+        SetStartWithWindows(false);
+        // Stop a running alert watcher so its exe can be deleted.
+        if (HWND tray = FindWindowW(L"SpaceRescue.Tray", nullptr)) SendMessageTimeoutW(tray, WM_CLOSE, 0, 0, SMTO_ABORTIFHUNG, 2000, nullptr);
         e = Uninstall();
         ok = L"SpaceRescue was removed (program, shortcut, context menu, settings and reserve file).";
     }
