@@ -905,6 +905,11 @@ void App::RefreshAfterChange()
 
 void App::OnActionApplied(const sr::ActionResult& result, const std::vector<sr::u32>& detached)
 {
+    // Background readers (duplicates, fragmentation, analysis) must be stopped before the tree changes.
+    State& g = G();
+    g.insights.StopBackground();
+    g.internals.StopBackground();
+    EndAnalysis();
     // Detach in reverse insertion order; nested nodes were already filtered by the dialog.
     if (m_tree)
         for (sr::u32 n : detached) m_tree->Detach(n);

@@ -350,6 +350,16 @@ ActionResult ActionManager::Apply(const ActionKind kind, const std::vector<std::
             r.summary = L"Nothing moved: no other drive is available for quarantine.";
             return r;
         }
+        // Quarantining onto the same drive frees nothing and writes to the full drive: refuse.
+        for (const auto& p : paths)
+        {
+            if (_wcsicmp(VolumeOf(p).c_str(), wv.c_str()) == 0)
+            {
+                for (const auto& q : paths) r.failed.push_back({ q, L"Quarantine must go to a different drive." });
+                r.summary = L"Nothing moved: the quarantine drive is the same drive as the files.";
+                return r;
+            }
+        }
         SYSTEMTIME st;
         GetLocalTime(&st);
         const std::wstring root = JoinPath(wv, L"SpaceRescue-Quarantine");

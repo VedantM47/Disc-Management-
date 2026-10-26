@@ -73,7 +73,8 @@ u64 NowTicks()
 std::wstring FormatAge(const u64 ticks)
 {
     const u64 now = NowTicks();
-    if (ticks == 0 || ticks > now) return L"unknown";
+    if (!IsPlausibleTime(ticks)) return L"date unknown";
+    if (ticks > now) return L"today";
     const u64 days = (now - ticks) / TicksPerDay;
     if (days == 0) return L"today";
     if (days < 60) return Fmt(L"%llu day%s ago", days, days == 1 ? L"" : L"s");

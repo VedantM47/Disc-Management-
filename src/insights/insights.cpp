@@ -113,7 +113,7 @@ int ClassifyDir(const Ctx& c, const std::wstring& lp, const std::wstring& ln, u3
 void AddStale(Ctx& c, const Node& n, u32 idx, StaleGroup* local, bool aggregate)
 {
     const u64 t = c.useAccess ? n.accessTime : n.writeTime;
-    if (t == 0 || t > c.now) return;
+    if (!IsPlausibleTime(t) || t > c.now) return; // placeholder dates would look decades stale
     const double days = static_cast<double>(c.now - t) / static_cast<double>(TicksPerDay);
     StaleResult& s = c.rep.stale;
     for (int b = 0; b < StaleResult::Buckets; ++b)

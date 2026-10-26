@@ -92,6 +92,9 @@ std::wstring ErrorText(DWORD error);
 inline u64 Ticks(const FILETIME& ft) { return (static_cast<u64>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime; }
 u64 NowTicks();
 constexpr u64 TicksPerDay = 864000000000ull;
+// Timestamps before 1990-01-01 are placeholders (e.g. 1980 DOS epoch from zip extraction), not real ages.
+constexpr u64 PlausibleTicks = 122756256000000000ull;
+inline bool IsPlausibleTime(u64 ticks) { return ticks >= PlausibleTicks && ticks <= NowTicks() + TicksPerDay; }
 // "3 days ago", "14 months ago"
 std::wstring FormatAge(u64 ticks);
 
