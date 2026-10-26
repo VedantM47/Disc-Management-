@@ -33,7 +33,7 @@ bool Fixup(BYTE* rec, u32 recordSize)
 {
     if (Read<u32>(rec, 0) != 0x454C4946) return false; // "FILE"
     const u16 usaOffset = Read<u16>(rec, 4), usaCount = Read<u16>(rec, 6);
-    if (usaCount < 2 || usaOffset + usaCount * 2u > recordSize) return false;
+    if (usaCount < 2 || usaCount != recordSize / 512 + 1 || usaOffset + usaCount * 2u > recordSize) return false;
     const u16 usn = Read<u16>(rec, usaOffset);
     for (u16 i = 1; i < usaCount; ++i)
     {
@@ -140,13 +140,22 @@ bool Scanner::ScanMft()
         {
             const u32 type = Read<u32>(rec, a);
             const u32 len = Read<u32>(rec, a + 4);
-            if (type == AttrEnd || len < 16 || a + len > recordSize) break;
+            if (type == AttrEnd || len < 16 || static_cast<u64>(a) + len > recordSize) break;
             const bool nonResident = rec[a + 8] != 0;
             const u8 nameLen = rec[a + 9];
             const u16 attrFlags = Read<u16>(rec, a + 0x0C);
             if (!nonResident && (type == AttrStandardInfo || type == AttrFileName))
             {
-                const BYTE* v = rec + a + Read<u16>(rec, a + 0x14);
+                // The value must lie inside the attribute (corrupt/torn records must not read past the record).
+                const u32 valueOffset = len >= 0x18 ? Read<u16>(rec, a + 0x14) : len, valueLen = len >= 0x18 ? Read<u32>(rec, a + 0x10) : 0;
+                const BYTE* v = rec + a + valueOffset;
+                if (static_cast<u64>(valueOffset) + valueLen > len ||
+                    valueLen < (type == AttrStandardInfo ? 0x24u : 0x42u) ||
+                    (type == AttrFileName && (v[0x40] == 0 || 0x42u + v[0x40] * 2u > valueLen)))
+                {
+                    a += len;
+                    continue;
+                }
                 if (type == AttrStandardInfo)
                 {
                     node.writeTime = Read<u64>(v, 0x08);
@@ -164,10 +173,11 @@ bool Scanner::ScanMft()
             {
                 if (!nonResident)
                 {
+                    if (len < 0x14) { a += len; continue; }
                     node.size = Read<u32>(rec, a + 0x10);
                     node.alloc = 0; // stored inside the MFT record (resident)
                 }
-                else if (Read<u64>(rec, a + 0x10) == 0) // first piece holds the sizes
+                else if (len >= 0x38 && Read<u64>(rec, a + 0x10) == 0) // first piece holds the sizes
                 {
                     node.size = Read<u64>(rec, a + 0x30);
                     node.alloc = (attrFlags & (AttrFlagCompressed | AttrFlagSparse)) && len >= 0x48 ?
@@ -233,6 +243,7 @@ bool Scanner::ScanMft()
         if (!keep[r] || r == RecordRoot) continue;
         const u64 parent = parentOf[r];
         if (parent >= records || (parent != RecordRoot && (!keep[parent] || parent < FirstUserRecord))) continue;
+        if (!(tree.At(NodeOf(parent)).flags & NF_DIR)) continue; // stale parent reference to a non-directory
         const u32 n = NodeOf(r), p = NodeOf(parent);
         Node& node = tree.At(n);
         node.parent = p;

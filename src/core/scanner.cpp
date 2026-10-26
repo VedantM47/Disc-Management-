@@ -176,7 +176,7 @@ void ScanTree::SetName(Node& node, NameCursor& cursor, const wchar_t* name, cons
     const bool wide = std::any_of(name, name + len, [](wchar_t c) { return c >= 0x80; });
     const u32 bytes = static_cast<u32>(len * (wide ? 2 : 1));
     u32 offset = cursor.used + (wide ? (cursor.used & 1) : 0); // UTF-16 names stay 2-byte aligned
-    if (offset + bytes > NameChunk)
+    if (cursor.chunk == 0xFFFFFFFFu || offset + bytes > NameChunk)
     {
         const u32 c = m_nameChunks.fetch_add(1, std::memory_order_relaxed);
         m_names[c].store(new BYTE[NameChunk], std::memory_order_release);
@@ -262,6 +262,8 @@ u32 ScanTree::Find(const std::wstring& path) const
 {
     const std::wstring rootName = Name(0);
     if (path.size() < rootName.size() || _wcsnicmp(path.c_str(), rootName.c_str(), rootName.size()) != 0) return NoNode;
+    // "C:\Users" must not match "C:\UsersX\..."
+    if (path.size() > rootName.size() && rootName.back() != L'\\' && path[rootName.size()] != L'\\') return NoNode;
     const std::wstring rest = path.substr(rootName.size());
     u32 cur = 0;
     size_t pos = 0;
@@ -425,6 +427,15 @@ void Scanner::Run()
         m_running = false;
         if (m_notify) PostMessageW(m_notify, m_doneMessage, 0, 0);
         return;
+    }
+    if (tree.Count() > 1) // a failed/cancelled MFT pass left unlinked placeholder nodes: start from a clean tree
+    {
+        const DWORD cluster = tree.clusterSize;
+        const std::wstring fileSystem = tree.fileSystem;
+        tree.~ScanTree();
+        new (&tree) ScanTree(m_options.root);
+        tree.clusterSize = cluster;
+        tree.fileSystem = fileSystem;
     }
 
     int threads = m_options.threads > 0 ? m_options.threads :

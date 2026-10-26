@@ -162,7 +162,12 @@ class Scanner
 public:
     ~Scanner();
     bool Start(const ScanOptions& options, HWND notify, UINT doneMessage);
-    void Cancel() { m_cancel = true; m_cv.notify_all(); }
+    void Cancel()
+    {
+        m_cancel = true;
+        { std::lock_guard<std::mutex> lock(m_qLock); } // avoid a lost wakeup for a worker between predicate check and wait
+        m_cv.notify_all();
+    }
     bool Running() const { return m_running.load(); }
     ScanProgress Progress();
     // Takes ownership of the finished tree (call after doneMessage).
