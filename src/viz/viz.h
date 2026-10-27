@@ -75,6 +75,8 @@ public:
     int Height() const { return m_height; }
     // Leaf node under a pixel, or NoNode.
     u32 Hit(int x, int y) const;
+    // Pixel rectangle a node (file or folder) occupies in the last render; false if it was too small to lay out.
+    bool RectOf(u32 node, TileRect* out) const;
     double LayoutMillis() const { return m_millis; }
 
 private:
@@ -83,7 +85,8 @@ private:
     void Cushion(int x0, int y0, int x1, int y1, const float* surface, const gfx::Color& color);
 
     std::vector<UINT32> m_pixels;
-    std::vector<TileRect> m_tiles;
+    std::vector<TileRect> m_tiles;   // leaves (hit testing)
+    std::vector<TileRect> m_all;     // every laid-out node, folders included (selection outline)
     int m_width = 0, m_height = 0;
     TreemapOptions m_opt;
     float m_lx = 0, m_ly = 0, m_lz = 0;
@@ -94,7 +97,9 @@ private:
 class FlameGraph
 {
 public:
+    // `hits` (optional) receives each drawn bar for hit testing.
     void Draw(gfx::Canvas& c, const ScanTree& tree, const KindModel& kinds, u32 root, const D2D1_RECT_F& area,
-        float rowHeight = 22.0f, int maxDepth = 12) const;
+        float rowHeight = 22.0f, int maxDepth = 12, std::vector<std::pair<D2D1_RECT_F, u32>>* hits = nullptr,
+        u32 selected = NoNode) const;
 };
 }

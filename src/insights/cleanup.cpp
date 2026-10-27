@@ -422,6 +422,16 @@ bool IsProtectedPath(const std::wstring& path)
     const std::wstring sys = VolumeOf(win);
     const std::wstring p = ToLower(path);
     const std::wstring lw = ToLower(win);
+    // Inside Windows-managed areas, these are meant to be cleaned (Disk Cleanup removes them too).
+    static const wchar_t* cleanable[] = { L"\\temp", L"\\softwaredistribution\\download", L"\\minidump",
+        L"\\serviceprofiles\\networkservice\\appdata\\local\\microsoft\\windows\\deliveryoptimization" };
+    for (const wchar_t* c : cleanable)
+    {
+        const std::wstring dir = lw + c;
+        if (p == dir || Within(p, dir + L"\\")) return false;
+    }
+    const std::wstring wer = ToLower(JoinPath(KnownFolder(CSIDL_COMMON_APPDATA), L"Microsoft\\Windows\\WER"));
+    if (p == wer || Within(p, wer + L"\\")) return false;
     if (Within(p, lw + L"\\") || p == lw) return true;
     static const wchar_t* rootFiles[] = { L"pagefile.sys", L"hiberfil.sys", L"swapfile.sys", L"bootmgr", L"bootnxt", L"dumpstack.log" };
     for (const wchar_t* f : rootFiles)

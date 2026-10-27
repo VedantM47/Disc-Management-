@@ -14,22 +14,26 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show)
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     int exitCode = 0;
     std::wstring scanPath;
-    // Phase D design preview of the new UI (see DESIGN.md).
-    if (sr::ui2::PreviewOptions preview; argv && sr::ui2::ParsePreviewArgs(argc, argv, &preview))
-    {
-        LocalFree(argv);
-        sr::Settings::Get().Load();
-        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-        return sr::ui2::RunPreview(instance, show, preview);
-    }
+    // Switches (/install, /tray, /bench, ...) first; then the app.
     if (argv && sr::HandleCommandLine(argc, argv, &exitCode, &scanPath))
     {
         LocalFree(argv);
         return exitCode;
     }
+    sr::ui2::PreviewOptions options;
+    const bool modern = !argv || sr::ui2::ParsePreviewArgs(argc, argv, &options);
     if (argv) LocalFree(argv);
-
     sr::Settings::Get().Load();
+
+    // The Direct2D interface is the default; /classic opens the original one.
+    if (modern)
+    {
+        if (options.path.empty()) options.path = scanPath;
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        const int result = sr::ui2::RunPreview(instance, show, options);
+        CoUninitialize();
+        return result;
+    }
 
     INITCOMMONCONTROLSEX icc = {};
     icc.dwSize = sizeof(icc);

@@ -116,6 +116,10 @@ $ldflags = @('-mwindows', '-static')
 if ($tag -eq 'gcc') { $ldflags += @('-static-libgcc', '-static-libstdc++') }
 if ($Release) { $ldflags += @('-s', '-Wl,--gc-sections') }
 
+# A running copy locks the exe ("Permission denied"): close copies started from this build folder.
+Get-CimInstance Win32_Process -Filter "Name='SpaceRescue.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.ExecutablePath -and ($_.ExecutablePath -ieq $out) } |
+    ForEach-Object { Write-Host "  closing running SpaceRescue (pid $($_.ProcessId)) to replace the exe"; Stop-Process -Id $_.ProcessId -Force; Start-Sleep -Milliseconds 300 }
 Write-Host "  LD  build\SpaceRescue.exe ($tag, $mode)"
 & $cxx @ldflags -o $out @objects @libs
 if ($LASTEXITCODE -ne 0) { Write-Host 'LINK FAILED' -ForegroundColor Red; exit 1 }

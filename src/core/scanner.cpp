@@ -288,6 +288,25 @@ u32 ScanTree::Find(const std::wstring& path) const
     return cur;
 }
 
+bool ScanTree::NameContainsI(const u32 i, const std::wstring& needle) const
+{
+    const Node& n = At(i);
+    const size_t len = n.nameLen, m = needle.size();
+    if (!m || m > len) return m == 0;
+    const BYTE* p = NameBytes(n.name);
+    auto ch = [&](size_t k) -> wchar_t {
+        const wchar_t c = n.nameWide ? reinterpret_cast<const wchar_t*>(p)[k] : static_cast<wchar_t>(p[k]);
+        return c < 0x80 ? static_cast<wchar_t>(c >= L'A' && c <= L'Z' ? c + 32 : c) : static_cast<wchar_t>(towlower(c));
+    };
+    for (size_t s = 0; s + m <= len; ++s)
+    {
+        size_t k = 0;
+        while (k < m && ch(s + k) == needle[k]) ++k;
+        if (k == m) return true;
+    }
+    return false;
+}
+
 std::vector<u32> ScanTree::PostOrder() const
 {
     std::vector<u32> order;

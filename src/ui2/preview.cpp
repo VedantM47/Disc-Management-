@@ -1,18 +1,26 @@
 // SpaceRescue - SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The SpaceRescue interface: left navigation rail, eight tabs drawn with the Direct2D design system
+// (DESIGN.md), and every action wired to the engines - scanning, cleanup with confirm + undo, system
+// tools, settings, alerts, search / command palette (Ctrl+K), drive and folder picking.
 
 #include "preview.h"
 
 #include "../gfx/gfx.h"
+#include "../insights/cleanup.h"
 #include "../insights/insights.h"
 #include "../insights/quickwins.h"
 #include "../internals/internals.h"
 #include "../notify/tray.h"
+#include "../rescue/actions.h"
 #include "../rescue/rescue.h"
 #include "../viz/viz.h"
 
 #include <dwmapi.h>
+#include <shobjidl.h>
 
 #include <cmath>
+#include <functional>
 #include <memory>
 #include <thread>
 
@@ -26,15 +34,54 @@ using gfx::Color;
 using gfx::Rect;
 using gfx::Text;
 
-constexpr UINT WM_SCAN_DONE = WM_APP + 60;
-constexpr UINT_PTR TimerProgress = 1, TimerAnim = 2;
+constexpr UINT WM_SCAN_DONE = WM_APP + 60, WM_ACTION_DONE = WM_APP + 61, WM_UNDO_DONE = WM_APP + 62;
+constexpr UINT_PTR TimerProgress = 1, TimerAnim = 2, TimerToast = 3, TimerSnapshot = 99;
 constexpr float Rail = 84, Top = 60, Margin = 28;
 constexpr float Pi = 3.14159265358979f;
+constexpr int PageReview = 8;
 
-const wchar_t* PageNames[] = { L"Overview", L"Explore", L"Map", L"Clean up", L"System", L"Disk internals", L"History", L"Settings" };
+const wchar_t* PageNames[] = { L"Overview", L"Explore", L"Map", L"Clean up", L"System", L"Disk internals", L"History",
+    L"Settings", L"Review" };
 const wchar_t PageIcons[] = { 0xE80F, 0xE8B7, 0xE9D9, 0xE74D, 0xE770, 0xEDA2, 0xE81C, 0xE713 };
 
-enum class Safety { Safe, Review, Caution, Protected };
+// Hit-test ids (one namespace per kind of control).
+enum Hot : int
+{
+    HotRail = 100, HotMapMode = 200, HotSunCard = 300, HotReviewAll = 400, HotExploreBtn = 401,
+    HotDriveChip = 600, HotSearch = 601, HotBannerRelease = 602, HotHog = 700, HotRow = 800, HotUp = 799,
+    HotTreemap = 798, HotCleanReview = 500, HotSysTool = 900, HotAlerts = 1000, HotReserveSize = 1010,
+    HotReserveAction = 1015, HotWorkVolume = 1020, HotThreadsMinus = 1030, HotThreadsPlus = 1031, HotTheme = 1040,
+    HotBrowseFile = 1100, HotRevBack = 2000, HotRevAll = 2001, HotRevNone = 2002, HotRevRecycle = 2003,
+    HotRevQuarantine = 2004, HotRevCompress = 2005, HotRevDelete = 2006, HotRevOpen = 2007, HotRevEmptyBin = 2008, HotRevItem = 100000, // review rows: own range (lists can hold thousands)
+    HotToastUndo = 3000, HotToastClose = 3001, HotPaletteItem = 4000, HotPaletteBox = 3999,
+    HotBack = 603, HotForward = 604, HotChevron = 5000, HotCleanGroup = 6000, HotFlame = 8000,
+};
+
+// Where the user is: what Back/Forward restore.
+struct Nav
+{
+    int page = 0;
+    u32 exploreRoot = 0;
+    u32 selected = NoNode;
+    u32 sunRoot = 0;
+    int mapMode = 0;
+};
+
+struct ReviewItem
+{
+    u32 node = NoNode;
+    std::wstring group;
+    Safety safety = Safety::Safe;
+    bool checked = false;
+    bool locked = false; // protected path: never deletable here
+};
+
+struct PaletteItem
+{
+    std::wstring title, detail;
+    wchar_t icon = 0xE721;
+    std::function<void()> run;
+};
 
 struct App
 {
@@ -42,48 +89,93 @@ struct App
     HWND hwnd = nullptr;
     Canvas canvas;
     const gfx::Palette* pal = &gfx::Dark();
-    int page = 0;
+    int page = 0, backPage = 3;
     int mapMode = 0;
-    int hoverRail = -1;
-    int hoverSeg = -1;
+    int hoverRail = -1, hoverSeg = -1, hoverHot = -1;
     u32 hoverTile = NoNode;
     float mouseX = 0, mouseY = 0;
     DWORD pageStart = 0, unfoldStart = 0;
+    int threads = 0;
 
     // Data
-    std::wstring root;
-    std::wstring volume;
+    std::wstring root, volume;
     u64 volTotal = 0, volFree = 0;
     std::unique_ptr<Scanner> scanner;
     std::unique_ptr<QuickWins> quick;
     DWORD scanStart = 0;
     std::unique_ptr<ScanTree> tree;
     std::unique_ptr<InsightsReport> report;
+    std::unique_ptr<CleanupReport> cleanup;
+    std::unique_ptr<SystemReport> system;
     std::unique_ptr<viz::KindModel> kinds;
     viz::Sunburst sun;
     u32 sunRoot = 0;
     viz::Treemap treemap;
     int treemapW = 0, treemapH = 0;
     u32 treemapRoot = NoNode;
+    D2D1_RECT_F treemapRect = {};
     viz::FlameGraph flame;
     VolumeInternals vol;
     FileInternals bigFile;
     SlackSummary slack;
     bool scanning = true;
-    std::thread analysis;
 
-    // Hit regions for this frame.
-    struct Hot { D2D1_RECT_F r; int id; };
-    std::vector<Hot> hots;
+    // Explore (WinDirStat-style tree list: inline expand, selection linked to the treemap)
+    u32 exploreRoot = 0;
+    u32 highlight = NoNode;              // the selected item
+    std::vector<u32> rowNodes;           // visible rows this frame
+    std::vector<std::pair<u32, int>> flat; // all rows (node, depth) of the expanded tree
+    std::vector<char> expanded;          // per node
+    int exploreScroll = 0;               // first visible row
+    int exploreRows = 1;                 // rows that fit
+    std::vector<u32> hogNodes;
+    std::vector<std::pair<D2D1_RECT_F, u32>> flameHits;
+    std::vector<std::pair<int, int>> cleanGroups; // hot id -> (section, group)
+
+    // Back / Forward
+    std::vector<Nav> back, forward;
+
+    // Review list + actions
+    std::wstring reviewTitle;
+    std::vector<ReviewItem> review;
+    float reviewScroll = 0;
+    bool busy = false;
+    std::thread worker;
+
+    // Toast
+    std::wstring toast;
+    int toastUndo = -1;
+    bool toastError = false;
+
+    // Command palette
+    bool palette = false;
+    std::wstring query;
+    int paletteSel = 0;
+    std::vector<PaletteItem> items;
+
+    struct HotRect { D2D1_RECT_F r; int id; };
+    std::vector<HotRect> hots;
 };
 App g;
 
 const gfx::Palette& P() { return *g.pal; }
+void Invalidate() { InvalidateRect(g.hwnd, nullptr, FALSE); }
+bool Low() { return g.volTotal && IsLow(g.volFree, g.volTotal, Settings::Get().rescue); }
+
+void StartScan(const std::wstring& root);
+void SetPage(int p);
+Nav Current();
+void Go(const Nav& to);
+void NodeMenu(u32 node);
+bool GoToPath(std::wstring path);
+void RunAction(ActionKind kind);
+void OpenReview(const std::wstring& title, std::vector<ReviewItem> items);
+void ShowToast(const std::wstring& text, int undoId = -1, bool error = false);
 
 std::wstring Share(u64 bytes)
 {
     if (!g.volTotal) return FormatBytes(bytes);
-    return FormatBytes(bytes) + L" · " + FormatPercent(static_cast<double>(bytes) / static_cast<double>(g.volTotal)) +
+    return FormatBytes(bytes) + L" \u00B7 " + FormatPercent(static_cast<double>(bytes) / static_cast<double>(g.volTotal)) +
         L" of " + g.volume.substr(0, 2);
 }
 
@@ -106,6 +198,9 @@ const wchar_t* SafetyLabel(Safety s)
 
 // --- Small components ---------------------------------------------------------
 
+void HotArea(const D2D1_RECT_F& r, int id) { g.hots.push_back({ r, id }); }
+bool Hovered(int id) { return g.hoverHot == id; }
+
 void Badge(Canvas& c, float x, float y, Safety s)
 {
     const std::wstring label = SafetyLabel(s);
@@ -118,26 +213,37 @@ void Badge(Canvas& c, float x, float y, Safety s)
 
 float BadgeWidth(Canvas& c, Safety s) { return c.Measure(SafetyLabel(s), Text::CaptionStrong).width + 22; }
 
-void Button(Canvas& c, const D2D1_RECT_F& r, const std::wstring& label, bool primary, int id = -1)
+enum class Btn { Primary, Secondary, Danger, Disabled };
+
+void Button(Canvas& c, const D2D1_RECT_F& r, const std::wstring& label, Btn kind, int id = -1)
 {
-    if (primary)
+    const bool hover = id >= 0 && Hovered(id) && kind != Btn::Disabled;
+    switch (kind)
     {
-        c.FillRound(r, 8, P().accent);
+    case Btn::Primary:
+        c.FillRound(r, 8, hover ? P().accent.Mix(P().text, 0.15f) : P().accent);
         c.Text(label, r, Text::BodyStrong, P().accentInk, Align::Center, true);
-    }
-    else
-    {
-        c.FillRound(r, 8, P().surface2);
+        break;
+    case Btn::Danger:
+        c.FillRound(r, 8, P().caution.WithAlpha(hover ? 0.28f : 0.16f));
+        c.Text(label, r, Text::BodyStrong, P().caution, Align::Center, true);
+        break;
+    case Btn::Disabled:
+        c.FillRound(r, 8, P().surface2.WithAlpha(0.5f));
+        c.Text(label, r, Text::BodyStrong, P().textFaint, Align::Center, true);
+        break;
+    default:
+        c.FillRound(r, 8, hover ? P().surface3 : P().surface2);
         c.StrokeRound(r, 8, P().stroke);
         c.Text(label, r, Text::BodyStrong, P().text, Align::Center, true);
     }
-    if (id >= 0) g.hots.push_back({ r, id });
+    if (id >= 0 && kind != Btn::Disabled) HotArea(r, id);
 }
 
 void Overline(Canvas& c, const std::wstring& s, float x, float y, float w)
 {
     std::wstring up = s;
-    CharUpperBuffW(&up[0], static_cast<DWORD>(up.size()));
+    if (!up.empty()) CharUpperBuffW(&up[0], static_cast<DWORD>(up.size()));
     c.Text(up, Rect(x, y, w, 16), Text::Overline, P().textFaint);
 }
 
@@ -157,77 +263,126 @@ void EmptyState(Canvas& c, const D2D1_RECT_F& r, wchar_t glyph, const std::wstri
     c.Text(body, { r.left + 40, cy + 56, r.right - 40, cy + 100 }, Text::Caption, P().textDim, Align::Center);
 }
 
-// --- Frame: rail + top bar ------------------------------------------------------
+void Toggle(Canvas& c, float x, float y, bool on, int id)
+{
+    c.FillRound(Rect(x, y, 40, 20), 10, on ? P().accent : P().surface3);
+    c.Circle(on ? x + 30 : x + 10, y + 10, 7, on ? P().accentInk : P().textDim);
+    HotArea(Rect(x - 4, y - 4, 48, 28), id);
+}
+
+void Segmented(Canvas& c, float x, float y, const std::vector<std::wstring>& labels, int sel, int baseId)
+{
+    float w = 0;
+    for (const auto& s : labels) w += c.Measure(s, Text::BodyStrong).width + 28;
+    c.FillRound(Rect(x, y, w + 6, 32), 8, P().surface2);
+    float cx = x + 3;
+    for (size_t i = 0; i < labels.size(); ++i)
+    {
+        const float iw = c.Measure(labels[i], Text::BodyStrong).width + 28;
+        const D2D1_RECT_F r = Rect(cx, y + 3, iw, 26);
+        if (static_cast<int>(i) == sel) c.FillRound(r, 6, P().surface1);
+        else if (Hovered(baseId + static_cast<int>(i))) c.FillRound(r, 6, P().surface3);
+        c.Text(labels[i], r, Text::BodyStrong, static_cast<int>(i) == sel ? P().text : P().textDim, Align::Center, true);
+        HotArea(r, baseId + static_cast<int>(i));
+        cx += iw;
+    }
+}
+
+// --- Frame: rail, top bar, banner, toast ----------------------------------------
 
 void DrawRail(Canvas& c)
 {
     c.Fill(Rect(0, 0, Rail, c.Height()), P().base);
-    // Brand mark
     c.FillRound(Rect(22, 14, 40, 40), 12, P().accent);
     c.ArcStroke(42, 34, 11, 0.6f, 2 * Pi - 0.2f, 4, P().accentInk);
     c.Circle(42, 34, 3.5f, P().accentInk);
+    const int current = g.page == PageReview ? 3 : g.page;
     for (int i = 0; i < 8; ++i)
     {
         const float y = 80 + static_cast<float>(i) * 66;
         const D2D1_RECT_F r = Rect(8, y, Rail - 16, 60);
-        const bool sel = i == g.page;
+        const bool sel = i == current;
         if (sel) c.FillRound(r, 10, P().surface2);
         else if (i == g.hoverRail) c.FillRound(r, 10, P().surface2.WithAlpha(0.5f));
         if (sel) c.FillRound(Rect(4, y + 18, 3, 24), 1.5f, P().accent);
         c.Icon(PageIcons[i], (Rail - 22) / 2, y + 8, 22, sel ? P().accent : P().textDim);
         c.Text(PageNames[i], Rect(8, y + 34, Rail - 16, 18), Text::Caption, sel ? P().text : P().textDim, Align::Center);
-        g.hots.push_back({ r, 100 + i });
+        HotArea(r, HotRail + i);
     }
 }
 
 void DrawTopBar(Canvas& c)
 {
     const float x = Rail + Margin;
-    c.Text(PageNames[g.page], Rect(x, 14, 400, 36), Text::Title, P().text, Align::Left, true);
-    // Drive chip
-    const std::wstring chip = g.volume.substr(0, 2) + L"  " + FormatBytes(g.volFree) + L" free of " + FormatBytes(g.volTotal);
-    const float cw = c.Measure(chip, Text::BodyStrong).width + 56;
+    // Back / Forward (Alt+Left/Right, mouse side buttons, Backspace).
+    const bool canBack = !g.back.empty(), canFwd = !g.forward.empty();
+    const D2D1_RECT_F bb = Rect(x, 18, 30, 30), fb = Rect(x + 34, 18, 30, 30);
+    if (canBack && Hovered(HotBack)) c.FillRound(bb, 8, P().surface2);
+    if (canFwd && Hovered(HotForward)) c.FillRound(fb, 8, P().surface2);
+    c.Icon(0xE72B, bb.left + 7, bb.top + 7, 16, canBack ? P().text : P().textFaint);
+    c.Icon(0xE72A, fb.left + 7, fb.top + 7, 16, canFwd ? P().text : P().textFaint);
+    if (canBack) HotArea(bb, HotBack);
+    if (canFwd) HotArea(fb, HotForward);
+    c.Text(PageNames[g.page], Rect(x + 76, 14, 400, 36), Text::Title, P().text, Align::Left, true);
+    // Drive chip: click to pick another drive or folder.
+    const std::wstring chip = (g.root.size() <= 3 ? g.volume.substr(0, 2) : g.root) + L"  " + FormatBytes(g.volFree) +
+        L" free of " + FormatBytes(g.volTotal);
+    const float cw = std::min(c.Measure(chip, Text::BodyStrong).width + 74, 520.0f);
     const float cx = c.Width() - Margin - 300 - 12 - cw;
     const D2D1_RECT_F cr = Rect(cx, 16, cw, 32);
-    c.FillRound(cr, 16, P().surface1);
+    c.FillRound(cr, 16, Hovered(HotDriveChip) ? P().surface2 : P().surface1);
     c.StrokeRound(cr, 16, P().stroke);
     const double used = g.volTotal ? 1.0 - static_cast<double>(g.volFree) / static_cast<double>(g.volTotal) : 0;
-    const bool low = g.volTotal && IsLow(g.volFree, g.volTotal, RescueConfig());
-    c.ArcStroke(cx + 18, 32, 7, 0, static_cast<float>(used) * 2 * Pi, 3, low ? P().caution : P().accent);
-    c.Text(chip, Rect(cx + 34, 16, cw - 40, 32), Text::BodyStrong, P().text, Align::Left, true);
-    // Command palette field
+    c.ArcStroke(cx + 18, 32, 7, 0, static_cast<float>(used) * 2 * Pi, 3, Low() ? P().caution : P().accent);
+    c.Text(chip, Rect(cx + 34, 16, cw - 64, 32), Text::BodyStrong, P().text, Align::Left, true);
+    c.Icon(0xE70D, cr.right - 26, 25, 14, P().textDim);
+    HotArea(cr, HotDriveChip);
+    // Search field opens the command palette.
     const D2D1_RECT_F sr = Rect(c.Width() - Margin - 300, 16, 300, 32);
-    c.FillRound(sr, 8, P().surface1);
+    c.FillRound(sr, 8, Hovered(HotSearch) ? P().surface2 : P().surface1);
     c.StrokeRound(sr, 8, P().stroke);
     c.Icon(0xE721, sr.left + 10, 23, 16, P().textFaint);
     c.Text(L"Search or run a command", Rect(sr.left + 34, 16, 200, 32), Text::Body, P().textFaint, Align::Left, true);
     c.FillRound(Rect(sr.right - 52, 22, 44, 20), 5, P().surface2);
     c.Text(L"Ctrl K", Rect(sr.right - 52, 22, 44, 20), Text::Caption, P().textDim, Align::Center, true);
+    HotArea(sr, HotSearch);
+}
+
+// Rescue Mode banner (calm, caution accent). Returns its height.
+float DrawBanner(Canvas& c, float y)
+{
+    if (!Low()) return 0;
+    const D2D1_RECT_F r = Rect(Rail + Margin, y, c.Width() - Rail - 2 * Margin, 52);
+    c.FillRound(r, 12, P().caution.WithAlpha(P().dark ? 0.16f : 0.10f));
+    c.Icon(0xE7BA, r.left + 16, r.top + 16, 20, P().caution);
+    const std::wstring work = PickWorkVolume(g.volume, Settings::Get().rescue);
+    c.Text(g.volume.substr(0, 2) + L" is almost full (" + FormatBytes(g.volFree) + L" free). Rescue Mode is on: nothing is written to " +
+        g.volume.substr(0, 2) + L"." + (work.empty() ? L" No other drive for quarantine." : L" Quarantine goes to " + work.substr(0, 2) + L"."),
+        Rect(r.left + 48, r.top, r.right - r.left - 260, 52), Text::BodyStrong, P().text, Align::Left, true);
+    const ReserveStatus rs = QueryReserve();
+    if (rs.exists && _wcsicmp(VolumeOf(rs.path).c_str(), g.volume.c_str()) == 0)
+        Button(c, Rect(r.right - 210, r.top + 10, 196, 32), L"Release reserve (+" + FormatBytes(rs.size) + L")", Btn::Primary, HotBannerRelease);
+    return 64;
+}
+
+void DrawToast(Canvas& c)
+{
+    if (g.toast.empty()) return;
+    const float w = std::min(760.0f, c.Width() - Rail - 80);
+    const float x = Rail + (c.Width() - Rail - w) / 2, y = c.Height() - 84;
+    const D2D1_RECT_F r = Rect(x, y, w, 56);
+    c.Shadow(r, 12, 24, 8, P().dark ? 0.4f : 0.16f);
+    c.FillRound(r, 12, P().surface2);
+    c.StrokeRound(r, 12, g.toastError ? P().caution : P().stroke);
+    c.Icon(g.toastError ? 0xE783 : 0xE73E, x + 16, y + 18, 20, g.toastError ? P().caution : P().safe);
+    const float right = g.toastUndo >= 0 ? 170 : 60;
+    c.Text(g.toast, Rect(x + 48, y + 4, w - 48 - right, 48), Text::Body, P().text, Align::Left, true);
+    if (g.toastUndo >= 0) Button(c, Rect(r.right - 160, y + 12, 100, 32), L"Undo", Btn::Primary, HotToastUndo);
+    c.Icon(0xE711, r.right - 44, y + 18, 16, P().textDim);
+    HotArea(Rect(r.right - 52, y + 8, 40, 40), HotToastClose);
 }
 
 // --- Pages ------------------------------------------------------------------------
-
-struct Reclaim { u64 safe = 0, review = 0, caution = 0; };
-
-Reclaim ReclaimSplit()
-{
-    Reclaim r;
-    if (!g.report) return r;
-    for (const CategoryResult& cr : g.report->categories)
-    {
-        switch (cr.id)
-        {
-        case Category::TempFiles: case Category::BrowserCaches: case Category::WindowsUpdate: case Category::RecycleBin:
-            r.safe += cr.bytes; break;
-        case Category::DevCaches: case Category::OldDownloads: case Category::Installers: case Category::Duplicates:
-            r.review += cr.bytes; break;
-        case Category::Videos:
-            r.caution += cr.bytes; break;
-        default: break;
-        }
-    }
-    return r;
-}
 
 void DrawSunburstHero(Canvas& c, const D2D1_RECT_F& card)
 {
@@ -237,14 +392,10 @@ void DrawSunburstHero(Canvas& c, const D2D1_RECT_F& card)
     const float outer = std::min(w - 48, h - legendH - 40) / 2;
     const float cx = (card.left + card.right) / 2, cy = card.top + 20 + outer;
     const float inner = outer * 0.40f;
-    const float t = gfx::Ease(g.unfoldStart, 700, true);
-    g.sun.Draw(c, *g.kinds, cx, cy, inner, outer, t, g.page == 0 ? g.hoverSeg : -1);
-    // Centre: free space
-    const bool low = IsLow(g.volFree, g.volTotal, RescueConfig());
+    g.sun.Draw(c, *g.kinds, cx, cy, inner, outer, gfx::Ease(g.unfoldStart, 700, true), g.page == 0 ? g.hoverSeg : -1);
     c.Text(g.volume.substr(0, 2), Rect(cx - inner, cy - 44, inner * 2, 18), Text::Overline, P().textFaint, Align::Center);
-    c.Text(FormatBytes(g.volFree), Rect(cx - inner, cy - 26, inner * 2, 40), Text::Number, low ? P().caution : P().text, Align::Center);
+    c.Text(FormatBytes(g.volFree), Rect(cx - inner, cy - 26, inner * 2, 40), Text::Number, Low() ? P().caution : P().text, Align::Center);
     c.Text(L"free of " + FormatBytes(g.volTotal), Rect(cx - inner, cy + 14, inner * 2, 18), Text::Caption, P().textDim, Align::Center);
-    // Legend: top kinds
     std::vector<std::pair<u64, int>> order;
     for (size_t k = 0; k < g.kinds->totals.size(); ++k) order.push_back({ g.kinds->totals[k], static_cast<int>(k) });
     std::sort(order.rbegin(), order.rend());
@@ -254,11 +405,10 @@ void DrawSunburstHero(Canvas& c, const D2D1_RECT_F& card)
         if (i == 3) { lx = card.left + 24; ly += 26; }
         const auto kind = static_cast<gfx::FileKind>(order[static_cast<size_t>(i)].second);
         c.FillRound(Rect(lx, ly + 5, 10, 10), 3, P().Kind(kind));
-        const std::wstring s = std::wstring(gfx::KindLabel(kind)) + L"  " + FormatBytes(order[static_cast<size_t>(i)].first);
-        c.Text(s, Rect(lx + 16, ly, (w - 48) / 3 - 18, 20), Text::Caption, P().textDim);
+        c.Text(std::wstring(gfx::KindLabel(kind)) + L"  " + FormatBytes(order[static_cast<size_t>(i)].first),
+            Rect(lx + 16, ly, (w - 48) / 3 - 18, 20), Text::Caption, P().textDim);
         lx += (w - 48) / 3;
     }
-    g.hots.push_back({ card, 300 });
 }
 
 void PageOverview(Canvas& c, const D2D1_RECT_F& area)
@@ -266,21 +416,20 @@ void PageOverview(Canvas& c, const D2D1_RECT_F& area)
     const float w = area.right - area.left;
     const float heroW = std::min(w * 0.52f, area.bottom - area.top);
     DrawSunburstHero(c, { area.left, area.top, area.left + heroW, area.bottom });
-
     const float x = area.left + heroW + 20, rw = area.right - x;
-    // Reclaim meter
-    const Reclaim rc = ReclaimSplit();
-    const u64 total = rc.safe + rc.review + rc.caution;
+
+    const CleanupReport& cr = *g.cleanup;
+    const u64 total = cr.safeBytes + cr.reviewBytes + cr.cautionBytes;
     const D2D1_RECT_F mc = { x, area.top, area.right, area.top + 218 };
     c.Card(mc, 16);
     Overline(c, L"You can safely free", x + 24, mc.top + 22, rw);
-    c.Text(FormatBytes(rc.safe), Rect(x + 24, mc.top + 40, rw - 48, 56), Text::Hero, P().text);
-    c.Text(L"right now, plus " + FormatBytes(rc.review) + L" to review", Rect(x + 24, mc.top + 96, rw - 48, 20), Text::Body, P().textDim);
+    c.Text(FormatBytes(cr.safeBytes), Rect(x + 24, mc.top + 40, rw - 48, 56), Text::Hero, P().text);
+    c.Text(L"right now, plus " + FormatBytes(cr.reviewBytes) + L" to review", Rect(x + 24, mc.top + 96, rw - 48, 20), Text::Body, P().textDim);
     const D2D1_RECT_F bar = Rect(x + 24, mc.top + 128, rw - 48, 10);
     c.FillRound(bar, 5, P().freeSpace);
     float bx = bar.left;
     const Safety order[] = { Safety::Safe, Safety::Review, Safety::Caution };
-    const u64 parts[] = { rc.safe, rc.review, rc.caution };
+    const u64 parts[] = { cr.safeBytes, cr.reviewBytes, cr.cautionBytes };
     for (int i = 0; i < 3; ++i)
     {
         if (!total || !parts[i]) continue;
@@ -296,26 +445,23 @@ void PageOverview(Canvas& c, const D2D1_RECT_F& area)
         c.Text(s, Rect(lx + 12, mc.top + 147, 150, 18), Text::Caption, P().textDim);
         lx += c.Measure(s, Text::Caption).width + 32;
     }
-    Button(c, Rect(x + 24, mc.bottom - 50, 200, 36), L"Review and free space", true, 400);
-    Button(c, Rect(x + 236, mc.bottom - 50, 120, 36), L"Explore", false, 101);
+    Button(c, Rect(x + 24, mc.bottom - 50, 200, 36), L"Review and free space", Btn::Primary, HotReviewAll);
+    Button(c, Rect(x + 236, mc.bottom - 50, 120, 36), L"Explore", Btn::Secondary, HotExploreBtn);
 
-    // Top 5 hogs
     float y = mc.bottom + 24;
-    Overline(c, L"Biggest space users", x, y, rw);
+    Overline(c, L"Biggest space users \u00B7 click to explore", x, y, rw);
     y += 24;
     std::vector<const Hog*> hogs;
-    if (g.report)
-    {
-        for (const Hog& hgt : g.report->topFolders) hogs.push_back(&hgt);
-        for (const Hog& hgt : g.report->topFiles) hogs.push_back(&hgt);
-        std::sort(hogs.begin(), hogs.end(), [](const Hog* a, const Hog* b) { return g.tree->At(a->node).size > g.tree->At(b->node).size; });
-    }
+    for (const Hog& hg : g.report->topFolders) hogs.push_back(&hg);
+    for (const Hog& hg : g.report->topFiles) hogs.push_back(&hg);
+    std::sort(hogs.begin(), hogs.end(), [](const Hog* a, const Hog* b) { return g.tree->At(a->node).size > g.tree->At(b->node).size; });
+    g.hogNodes.clear();
     const float rowH = 62;
     for (size_t i = 0; i < hogs.size() && i < 5 && y + rowH <= area.bottom; ++i)
     {
         const Hog& hg = *hogs[i];
         const D2D1_RECT_F r = { x, y, area.right, y + rowH - 8 };
-        c.Card(r, 12);
+        c.Card(r, 12, Hovered(HotHog + static_cast<int>(i)));
         const Color kc = P().Kind(g.kinds->Of(hg.node));
         c.FillRound(Rect(r.left + 14, r.top + 13, 28, 28), 8, kc.WithAlpha(0.18f));
         c.Icon(g.tree->IsDir(hg.node) ? 0xE8B7 : 0xE7C3, r.left + 20, r.top + 19, 16, kc);
@@ -324,55 +470,167 @@ void PageOverview(Canvas& c, const D2D1_RECT_F& area)
         c.Text(FormatBytes(g.tree->At(hg.node).size), Rect(r.right - 190, r.top + 8, 172, 20), Text::BodyStrong, P().text, Align::Right);
         c.Text(FormatPercent(static_cast<double>(g.tree->At(hg.node).size) / static_cast<double>(std::max<u64>(1, g.volTotal))) +
             L" of " + g.volume.substr(0, 2), Rect(r.right - 190, r.top + 28, 172, 18), Text::Caption, P().textDim, Align::Right);
+        HotArea(r, HotHog + static_cast<int>(i));
+        g.hogNodes.push_back(hg.node);
         y += rowH;
     }
+}
+
+void EnsureTreemap(Canvas& c, const D2D1_RECT_F& inner, u32 root)
+{
+    const int pw = static_cast<int>((inner.right - inner.left) * c.Dpi() / 96.0f);
+    const int ph = static_cast<int>((inner.bottom - inner.top) * c.Dpi() / 96.0f);
+    if (pw != g.treemapW || ph != g.treemapH || g.treemapRoot != root)
+    {
+        g.treemap.Render(*g.tree, *g.kinds, P(), root, pw, ph);
+        g.treemapW = pw; g.treemapH = ph; g.treemapRoot = root;
+    }
+    g.treemapRect = inner;
+    c.PushClip(inner);
+    c.Pixels(g.treemap.Pixels(), static_cast<UINT>(pw), static_cast<UINT>(ph), inner);
+    // Selection outline (linked with the Explore list, like WinDirStat).
+    viz::TileRect tr;
+    if (g.highlight != NoNode && g.treemap.RectOf(g.highlight, &tr))
+    {
+        const float s = 96.0f / c.Dpi();
+        const D2D1_RECT_F sel = { inner.left + tr.x0 * s, inner.top + tr.y0 * s, inner.left + tr.x1 * s, inner.top + tr.y1 * s };
+        c.StrokeRound(sel, 2, Color(0xFFFFFF), 2.5f);
+        c.StrokeRound(gfx::Inset(sel, 2.5f), 1, Color(0x000000, 0.6f), 1.0f);
+    }
+    c.PopClip();
+    HotArea(inner, HotTreemap);
+}
+
+// Rebuilds the flattened tree (expanded folders show their children inline).
+void FlattenExplore()
+{
+    const ScanTree& t = *g.tree;
+    if (g.expanded.size() != t.Count()) g.expanded.assign(t.Count(), 0);
+    g.flat.clear();
+    std::vector<std::pair<u32, int>> stack;
+    const std::vector<u32> top = t.Children(g.exploreRoot);
+    for (auto it = top.rbegin(); it != top.rend(); ++it) stack.push_back({ *it, 0 });
+    while (!stack.empty() && g.flat.size() < 200000)
+    {
+        const auto [n, depth] = stack.back();
+        stack.pop_back();
+        g.flat.push_back({ n, depth });
+        if (g.expanded[n] && t.IsDir(n))
+        {
+            const std::vector<u32> kids = t.Children(n);
+            for (auto it = kids.rbegin(); it != kids.rend(); ++it) stack.push_back({ *it, depth + 1 });
+        }
+    }
+}
+
+int FlatIndexOf(u32 node)
+{
+    for (size_t i = 0; i < g.flat.size(); ++i) if (g.flat[i].first == node) return static_cast<int>(i);
+    return -1;
+}
+
+// Selects `node` in Explore: expands its ancestors (below the Explore root) and scrolls it into view.
+void Reveal(u32 node)
+{
+    const ScanTree& t = *g.tree;
+    if (g.expanded.size() != t.Count()) g.expanded.assign(t.Count(), 0);
+    for (u32 p = t.At(node).parent; p != NoNode && p != g.exploreRoot; p = t.At(p).parent) g.expanded[p] = 1;
+    g.highlight = node;
+    FlattenExplore();
+    const int i = FlatIndexOf(node);
+    if (i >= 0 && (i < g.exploreScroll || i >= g.exploreScroll + g.exploreRows)) g.exploreScroll = std::max(0, i - g.exploreRows / 2);
+}
+
+std::vector<u32> Ancestors(u32 node)
+{
+    std::vector<u32> chain;
+    for (u32 n = node; n != NoNode; n = g.tree->At(n).parent) chain.push_back(n);
+    std::reverse(chain.begin(), chain.end());
+    return chain;
 }
 
 void PageExplore(Canvas& c, const D2D1_RECT_F& area)
 {
     const ScanTree& t = *g.tree;
+    const u32 here = g.exploreRoot;
     const float split = area.top + (area.bottom - area.top) * 0.56f;
-    // Breadcrumb
-    c.Text(g.root + L"  ›  biggest first", Rect(area.left, area.top, 600, 20), Text::Caption, P().textDim);
-    // Tree list
+    // Breadcrumb: every part is clickable; plus "Open in File Explorer".
+    float bx = area.left;
+    const std::vector<u32> crumbs = Ancestors(here);
+    for (size_t i = 0; i < crumbs.size(); ++i)
+    {
+        std::wstring name = t.Name(crumbs[i]);
+        if (i == 0 && name.size() == 2 && name[1] == L':') name += L'\\';
+        const float w = std::min(c.Measure(name, Text::BodyStrong).width + 16, 220.0f);
+        const D2D1_RECT_F r = Rect(bx, area.top - 6, w, 28);
+        const int id = HotChevron + 900 + static_cast<int>(i); // crumb ids
+        if (Hovered(id)) c.FillRound(r, 6, P().surface2);
+        c.Text(name, r, Text::BodyStrong, i + 1 == crumbs.size() ? P().text : P().textDim, Align::Center, true);
+        HotArea(r, id);
+        bx += w;
+        if (i + 1 < crumbs.size()) { c.Icon(0xE76C, bx, area.top + 1, 12, P().textFaint); bx += 16; }
+        if (bx > area.right - 420) break;
+    }
+    Button(c, Rect(area.right - 190, area.top - 6, 190, 28), L"Open in File Explorer", Btn::Secondary, HotUp + 1000);
+    c.Text(FormatBytes(t.At(here).size) + L" \u00B7 double-click to open \u00B7 right-click for actions",
+        Rect(area.right - 600, area.top - 6, 400, 28), Text::Caption, P().textFaint, Align::Right, true);
+
     const float listW = (area.right - area.left) * 0.64f;
-    const D2D1_RECT_F lc = { area.left, area.top + 26, area.left + listW, split - 12 };
+    const D2D1_RECT_F lc = { area.left, area.top + 30, area.left + listW, split - 12 };
     c.Card(lc, 12);
     const float cols[] = { lc.left + 16, lc.right - 360, lc.right - 250, lc.right - 160, lc.right - 90 };
     const wchar_t* heads[] = { L"Name", L"Share", L"Size", L"Files", L"Changed" };
-    // Header cells use the same boxes as the row cells below, so right-aligned numbers line up.
     const D2D1_RECT_F headBoxes[] = { Rect(cols[0], lc.top + 10, 300, 18), Rect(cols[1], lc.top + 10, 90, 18),
         Rect(cols[2] - 10, lc.top + 10, 100, 18), Rect(cols[3] - 10, lc.top + 10, 80, 18), Rect(cols[4] - 30, lc.top + 10, 104, 18) };
-    for (int i = 0; i < 5; ++i)
-        c.Text(heads[i], headBoxes[i], Text::CaptionStrong, P().textFaint, i >= 2 ? Align::Right : Align::Left);
+    for (int i = 0; i < 5; ++i) c.Text(heads[i], headBoxes[i], Text::CaptionStrong, P().textFaint, i >= 2 ? Align::Right : Align::Left);
     c.Line(lc.left + 12, lc.top + 34, lc.right - 12, lc.top + 34, P().stroke);
-    std::vector<std::pair<u32, int>> rows;
-    const std::vector<u32> top = t.Children(t.Root());
-    for (size_t i = 0; i < top.size(); ++i)
-    {
-        rows.push_back({ top[i], 0 });
-        if (i == 0 && t.IsDir(top[i]))
-            for (u32 ch : t.Children(top[i])) { rows.push_back({ ch, 1 }); if (rows.size() > 7) break; }
-    }
+
+    FlattenExplore();
+    const float rowH = 28;
+    g.exploreRows = std::max(1, static_cast<int>((lc.bottom - 6 - (lc.top + 40)) / rowH));
+    g.exploreScroll = std::clamp(g.exploreScroll, 0, std::max(0, static_cast<int>(g.flat.size()) - g.exploreRows));
+    g.rowNodes.clear();
     float y = lc.top + 40;
-    const u64 rootSize = std::max<u64>(1, t.At(t.Root()).size);
-    for (size_t i = 0; i < rows.size() && y + 26 <= lc.bottom - 6; ++i)
+    for (int i = g.exploreScroll; i < static_cast<int>(g.flat.size()) && i < g.exploreScroll + g.exploreRows; ++i)
     {
-        const u32 n = rows[i].first;
-        const float indent = 18.0f * static_cast<float>(rows[i].second);
-        if (i == 1) c.FillRound({ lc.left + 6, y - 2, lc.right - 6, y + 26 }, 6, P().surface2);
-        if (t.IsDir(n)) c.Icon(i == 0 ? 0xE70D : 0xE76C, cols[0] + indent - 4, y + 4, 12, P().textFaint);
-        c.FillRound(Rect(cols[0] + indent + 14, y + 7, 10, 10), 3, P().Kind(g.kinds->Of(n)));
-        c.Text(t.Name(n), Rect(cols[0] + indent + 30, y, cols[1] - cols[0] - indent - 40, 24), Text::Body, P().text, Align::Left, true);
-        const double share = static_cast<double>(t.At(n).size) / static_cast<double>(rootSize);
+        const auto [n, depth] = g.flat[static_cast<size_t>(i)];
+        const int slot = static_cast<int>(g.rowNodes.size());
+        g.rowNodes.push_back(n);
+        const float indent = 18.0f * static_cast<float>(depth);
+        const D2D1_RECT_F row = { lc.left + 6, y - 2, lc.right - 6, y + 26 };
+        if (n == g.highlight) c.FillRound(row, 6, P().accent.WithAlpha(0.20f));
+        else if (Hovered(HotRow + slot)) c.FillRound(row, 6, P().surface2);
+        HotArea(row, HotRow + slot);
+        if (t.IsDir(n) && t.At(n).firstChild != NoNode)
+        {
+            const D2D1_RECT_F chev = Rect(cols[0] + indent - 8, y - 1, 22, 26);
+            if (Hovered(HotChevron + slot)) c.FillRound(chev, 4, P().surface3);
+            c.Icon(g.expanded[n] ? 0xE70D : 0xE76C, chev.left + 5, y + 5, 12, P().textDim);
+            HotArea(chev, HotChevron + slot);
+        }
+        c.FillRound(Rect(cols[0] + indent + 16, y + 7, 10, 10), 3, P().Kind(g.kinds->Of(n)));
+        c.Text(t.Name(n), Rect(cols[0] + indent + 32, y, cols[1] - cols[0] - indent - 42, 24), Text::Body,
+            (t.At(n).flags & NF_AGGREGATE) ? P().textDim : P().text, Align::Left, true);
+        const u32 parent = t.At(n).parent;
+        const double share = parent != NoNode && t.At(parent).size ? static_cast<double>(t.At(n).size) / static_cast<double>(t.At(parent).size) : 0;
         Bar(c, Rect(cols[1], y + 9, 64, 6), share, P().Kind(g.kinds->Of(n)));
         c.Text(FormatPercent(share), Rect(cols[1] + 68, y, 40, 24), Text::Caption, P().textDim, Align::Left, true);
         c.Text(FormatBytes(t.At(n).size), Rect(cols[2] - 10, y, 100, 24), Text::Body, P().text, Align::Right, true);
         c.Text(FormatCount(t.At(n).files), Rect(cols[3] - 10, y, 80, 24), Text::Caption, P().textDim, Align::Right, true);
         c.Text(FormatAge(t.At(n).writeTime), Rect(cols[4] - 30, y, 104, 24), Text::Caption, P().textDim, Align::Right, true);
-        y += 28;
+        y += rowH;
     }
-    // File types
+    // Scroll indicator
+    if (static_cast<int>(g.flat.size()) > g.exploreRows)
+    {
+        const float trackTop = lc.top + 40, trackH = lc.bottom - 8 - trackTop;
+        const float thumbH = std::max(24.0f, trackH * static_cast<float>(g.exploreRows) / static_cast<float>(g.flat.size()));
+        const float thumbY = trackTop + (trackH - thumbH) * static_cast<float>(g.exploreScroll) /
+            static_cast<float>(std::max<size_t>(1, g.flat.size() - static_cast<size_t>(g.exploreRows)));
+        c.FillRound(Rect(lc.right - 6, thumbY, 3, thumbH), 1.5f, P().textFaint.WithAlpha(0.6f));
+    }
+    if (g.flat.empty()) EmptyState(c, lc, 0xE8B7, L"This folder is empty", L"Nothing to show here.");
+    // File types of the whole scan.
     const D2D1_RECT_F fc = { lc.right + 16, lc.top, area.right, split - 12 };
     c.Card(fc, 12);
     c.Text(L"File types", Rect(fc.left + 16, fc.top + 10, 200, 20), Text::BodyStrong, P().text);
@@ -391,20 +649,10 @@ void PageExplore(Canvas& c, const D2D1_RECT_F& area)
         Bar(c, Rect(fc.left + 34, y + 22, fc.right - fc.left - 50, 3), sum ? static_cast<double>(o.first) / static_cast<double>(sum) : 0, P().Kind(kind));
         y += 32;
     }
-    // Treemap docked at the bottom, linked by colour
+    // Treemap of the current folder (click a tile to open its folder).
     const D2D1_RECT_F tc = { area.left, split, area.right, area.bottom };
     c.Card(tc, 12);
-    const D2D1_RECT_F inner = gfx::Inset(tc, 8);
-    const int pw = static_cast<int>((inner.right - inner.left) * c.Dpi() / 96.0f);
-    const int ph = static_cast<int>((inner.bottom - inner.top) * c.Dpi() / 96.0f);
-    if (pw != g.treemapW || ph != g.treemapH || g.treemapRoot != t.Root())
-    {
-        g.treemap.Render(t, *g.kinds, P(), t.Root(), pw, ph);
-        g.treemapW = pw; g.treemapH = ph; g.treemapRoot = t.Root();
-    }
-    c.PushClip(inner);
-    c.Pixels(g.treemap.Pixels(), static_cast<UINT>(pw), static_cast<UINT>(ph), inner);
-    c.PopClip();
+    EnsureTreemap(c, gfx::Inset(tc, 8), here);
 }
 
 void Tooltip(Canvas& c, float x, float y, u32 node, u64 bytes, const std::wstring& name)
@@ -426,16 +674,23 @@ void Tooltip(Canvas& c, float x, float y, u32 node, u64 bytes, const std::wstrin
         if (parent != NoNode && t.At(parent).size)
             line = FormatPercent(static_cast<double>(bytes) / static_cast<double>(t.At(parent).size)) + L" of " + t.Name(parent);
         c.Text(line, Rect(x + 16, y + 64, w - 32, 18), Text::Caption, P().textDim);
-        c.Text(FormatCount(t.At(node).files) + L" files · changed " + FormatAge(t.At(node).writeTime),
+        c.Text(FormatCount(t.At(node).files) + L" files \u00B7 changed " + FormatAge(t.At(node).writeTime),
             Rect(x + 16, y + 84, w - 32, 18), Text::Caption, P().textDim);
     }
     else c.Text(line, Rect(x + 16, y + 64, w - 32, 18), Text::Caption, P().textDim);
 }
 
+struct SunGeom { float cx, cy, inner, outer; };
+
+SunGeom MapGeometry(const D2D1_RECT_F& vr)
+{
+    const float outer = std::min(vr.right - vr.left, vr.bottom - vr.top) / 2 - 28;
+    return { (vr.left + vr.right) / 2, (vr.top + vr.bottom) / 2, outer * 0.32f, outer };
+}
+
 void PageMap(Canvas& c, const D2D1_RECT_F& area)
 {
     const ScanTree& t = *g.tree;
-    // Segmented toggle
     const wchar_t* modes[] = { L"Sunburst", L"Treemap", L"Flame graph" };
     const D2D1_RECT_F seg = Rect(area.left, area.top, 330, 34);
     c.FillRound(seg, 9, P().surface1);
@@ -445,180 +700,152 @@ void PageMap(Canvas& c, const D2D1_RECT_F& area)
         const D2D1_RECT_F r = Rect(seg.left + 3 + 108.0f * static_cast<float>(i), seg.top + 3, 106, 28);
         if (i == g.mapMode) c.FillRound(r, 7, P().surface3);
         c.Text(modes[i], r, Text::BodyStrong, i == g.mapMode ? P().text : P().textDim, Align::Center, true);
-        g.hots.push_back({ r, 200 + i });
+        HotArea(r, HotMapMode + i);
     }
-    c.Text(L"Click a ring to drill in, the centre to go up. Colours show what kind of files fill each folder.",
+    c.Text(g.mapMode == 0 ? L"Click a ring to open that folder, the centre to go back up." :
+           g.mapMode == 1 ? L"Click a tile to open its folder in Explore." : L"Each row is one folder level; width is size.",
         Rect(seg.right + 20, seg.top, 640, 34), Text::Caption, P().textDim, Align::Left, true);
     const D2D1_RECT_F vr = { area.left, area.top + 50, area.right, area.bottom };
     c.Card(vr, 16);
     if (g.mapMode == 0)
     {
-        const float outer = std::min(vr.right - vr.left, vr.bottom - vr.top) / 2 - 28;
-        const float cx = (vr.left + vr.right) / 2, cy = (vr.top + vr.bottom) / 2;
-        g.sun.Draw(c, *g.kinds, cx, cy, outer * 0.32f, outer, gfx::Ease(g.unfoldStart, 700, true), g.hoverSeg);
-        c.Text(t.Name(g.sunRoot), Rect(cx - 90, cy - 26, 180, 22), Text::BodyStrong, P().text, Align::Center);
-        c.Text(FormatBytes(t.At(g.sunRoot).size), Rect(cx - 90, cy - 4, 180, 30), Text::Number, P().text, Align::Center);
-        int seg2 = g.hoverSeg;
-        if (seg2 < 0 && !g.sun.Segments().empty()) seg2 = 0; // static demo: tooltip on the largest slice
-        if (seg2 >= 0)
+        const SunGeom s = MapGeometry(vr);
+        g.sun.Draw(c, *g.kinds, s.cx, s.cy, s.inner, s.outer, gfx::Ease(g.unfoldStart, 700, true), g.hoverSeg);
+        c.Text(t.Name(g.sunRoot), Rect(s.cx - 90, s.cy - 26, 180, 22), Text::BodyStrong, P().text, Align::Center);
+        c.Text(FormatBytes(t.At(g.sunRoot).size), Rect(s.cx - 90, s.cy - 4, 180, 30), Text::Number, P().text, Align::Center);
+        HotArea(vr, HotSunCard);
+        if (g.hoverSeg >= 0)
         {
-            const viz::Segment& s = g.sun.Segments()[static_cast<size_t>(seg2)];
-            const float mid = (s.a0 + s.a1) / 2;
-            const float rr = outer * 0.32f + (outer * 0.68f) * (static_cast<float>(s.depth) - 0.5f) / static_cast<float>(g.sun.MaxDepth());
-            const float tx = g.hoverSeg >= 0 ? g.mouseX : cx + rr * std::sin(mid), ty = g.hoverSeg >= 0 ? g.mouseY : cy - rr * std::cos(mid);
-            Tooltip(c, tx, ty, s.node, s.bytes, s.freeSpace ? L"Free space" : s.other ? L"Smaller items" : t.Name(s.node));
+            const viz::Segment& sg = g.sun.Segments()[static_cast<size_t>(g.hoverSeg)];
+            Tooltip(c, g.mouseX, g.mouseY, sg.node, sg.bytes, sg.freeSpace ? L"Free space" : sg.other ? L"Smaller items" : t.Name(sg.node));
         }
     }
     else if (g.mapMode == 1)
     {
-        const D2D1_RECT_F inner = gfx::Inset(vr, 10);
-        const int pw = static_cast<int>((inner.right - inner.left) * c.Dpi() / 96.0f);
-        const int ph = static_cast<int>((inner.bottom - inner.top) * c.Dpi() / 96.0f);
-        if (pw != g.treemapW || ph != g.treemapH)
-        {
-            g.treemap.Render(t, *g.kinds, P(), t.Root(), pw, ph);
-            g.treemapW = pw; g.treemapH = ph;
-        }
-        c.Pixels(g.treemap.Pixels(), static_cast<UINT>(pw), static_cast<UINT>(ph), inner);
-        c.Text(Fmt(L"Layout + shading %.0f ms", g.treemap.LayoutMillis()), Rect(vr.right - 220, vr.bottom - 26, 200, 18),
-            Text::Caption, Color(0xFFFFFF, 0.8f), Align::Right);
+        EnsureTreemap(c, gfx::Inset(vr, 10), t.Root());
         if (g.hoverTile != NoNode) Tooltip(c, g.mouseX, g.mouseY, g.hoverTile, t.At(g.hoverTile).size, t.Name(g.hoverTile));
     }
     else
-        g.flame.Draw(c, t, *g.kinds, t.Root(), gfx::Inset(vr, 16), 24, 14);
+    {
+        g.flameHits.clear();
+        g.flame.Draw(c, t, *g.kinds, t.Root(), gfx::Inset(vr, 16), 24, 14, &g.flameHits, g.highlight);
+        for (size_t i = 0; i < g.flameHits.size(); ++i) HotArea(g.flameHits[i].first, HotFlame + static_cast<int>(i));
+        const int hot = g.hoverHot - HotFlame;
+        if (hot >= 0 && hot < static_cast<int>(g.flameHits.size()))
+        {
+            const u32 n = g.flameHits[static_cast<size_t>(hot)].second;
+            Tooltip(c, g.mouseX, g.mouseY, n, t.At(n).size, t.Name(n));
+        }
+    }
 }
 
-struct Section
+Safety SectionSafety(CleanSection s)
 {
-    const wchar_t* title;
-    wchar_t icon;
-    Safety safety;
-    std::vector<Category> cats;
-    const wchar_t* note;
-};
+    return s == CleanSection::WindowsTemp || s == CleanSection::AppCaches ? Safety::Safe : Safety::Review;
+}
 
 void PageCleanup(Canvas& c, const D2D1_RECT_F& area)
 {
-    const Section sections[] = {
-        { L"Windows temp", 0xE7B8, Safety::Safe, { Category::TempFiles, Category::WindowsUpdate, Category::RecycleBin },
-          L"Scratch files Windows and apps leave behind. Removed files are recreated when needed." },
-        { L"App caches", 0xE774, Safety::Safe, { Category::BrowserCaches },
-          L"Browser and app caches rebuild themselves. Sign-ins and history are kept." },
-        { L"Developer", 0xE943, Safety::Review, { Category::DevCaches },
-          L"node_modules, Gradle, Maven, pip and NuGet caches. Restore with your package manager." },
-        { L"Old and unused", 0xE81C, Safety::Review, { Category::OldDownloads, Category::Installers, Category::Duplicates, Category::Videos },
-          L"Old downloads, installers you already ran, duplicates and large videos." },
-    };
+    const wchar_t icons[] = { 0xE7B8, 0xE774, 0xE943, 0xE81C };
+    const wchar_t* notes[] = {
+        L"Scratch files Windows and apps leave behind. They are recreated when needed.",
+        L"Browser and app caches rebuild themselves. Sign-ins and history are kept.",
+        L"Package caches and build output per project. Restore with your package manager.",
+        L"Old downloads, installers, large videos and files you haven't used in a year." };
     u64 grand = 0;
-    for (const Section& s : sections)
-        for (Category ct : s.cats) grand += g.report->categories[static_cast<size_t>(ct)].bytes;
-    c.Text(L"4 groups · " + FormatBytes(grand) + L" could be freed. Pick a group to review it item by item.",
-        Rect(area.left, area.top, 900, 22), Text::Body, P().textDim);
+    for (const auto& s : g.cleanup->sections) grand += s.bytes;
+    c.Text(L"4 groups \u00B7 " + FormatBytes(grand) + L" could be freed. Click Review to pick items; nothing is removed without confirming.",
+        Rect(area.left, area.top, 1000, 22), Text::Body, P().textDim);
     const float gw = (area.right - area.left - 20) / 2, gh = (area.bottom - area.top - 40 - 20) / 2;
     for (int i = 0; i < 4; ++i)
     {
-        const Section& s = sections[i];
+        const CleanSectionResult& s = g.cleanup->sections[static_cast<size_t>(i)];
+        const Safety safety = SectionSafety(s.id);
         const float x = area.left + static_cast<float>(i % 2) * (gw + 20);
         const float y = area.top + 36 + static_cast<float>(i / 2) * (gh + 20);
         const D2D1_RECT_F r = Rect(x, y, gw, gh);
         c.Card(r, 16, i == 0);
-        u64 total = 0;
-        for (Category ct : s.cats) total += g.report->categories[static_cast<size_t>(ct)].bytes;
-        c.FillRound(Rect(x + 20, y + 20, 36, 36), 10, SafetyColor(s.safety).WithAlpha(0.15f));
-        c.Icon(s.icon, x + 28, y + 28, 20, SafetyColor(s.safety));
+        c.FillRound(Rect(x + 20, y + 20, 36, 36), 10, SafetyColor(safety).WithAlpha(0.15f));
+        c.Icon(icons[i], x + 28, y + 28, 20, SafetyColor(safety));
         c.Text(s.title, Rect(x + 68, y + 18, gw - 200, 22), Text::BodyStrong, P().text);
-        c.Text(FormatBytes(total), Rect(x + 68, y + 38, gw - 200, 30), Text::Number, P().text);
-        Badge(c, r.right - 20 - BadgeWidth(c, s.safety), y + 22, s.safety);
-        c.Text(s.note, Rect(x + 20, y + 76, gw - 40, 36), Text::Caption, P().textDim);
-        float ry = y + 116;
-        for (Category ct : s.cats)
+        c.Text(FormatBytes(s.bytes), Rect(x + 68, y + 38, gw - 200, 30), Text::Number, P().text);
+        Badge(c, r.right - 20 - BadgeWidth(c, safety), y + 22, safety);
+        c.Text(notes[i], Rect(x + 20, y + 76, gw - 40, 36), Text::Caption, P().textDim);
+        float ry = y + 112;
+        for (size_t gi = 0; gi < s.groups.size(); ++gi)
         {
-            const CategoryResult& cr = g.report->categories[static_cast<size_t>(ct)];
+            const CleanGroup& grp = s.groups[gi];
             if (ry + 26 > r.bottom - 52) break;
-            c.Text(cr.title, Rect(x + 20, ry, gw - 160, 22), Text::Body, P().text, Align::Left, true);
-            c.Text(cr.bytes ? FormatBytes(cr.bytes) : std::wstring(L"—"), Rect(r.right - 140, ry, 120, 22), Text::Body,
-                P().textDim, Align::Right, true);
-            ry += 28;
+            const int id = HotCleanGroup + i * 200 + static_cast<int>(std::min<size_t>(gi, 199));
+            const D2D1_RECT_F rowR = Rect(x + 12, ry - 2, gw - 24, 26);
+            if (Hovered(id)) c.FillRound(rowR, 6, P().surface3);
+            HotArea(rowR, id);
+            c.Circle(x + 24, ry + 11, 3.5f, SafetyColor(grp.safety));
+            std::wstring name = grp.name;
+            if (grp.lastOpened) name += L"  \u00B7  opened " + FormatAge(grp.lastOpened);
+            c.Text(name, Rect(x + 34, ry, gw - 170, 22), Text::Body, P().text, Align::Left, true);
+            c.Text(FormatBytes(grp.bytes), Rect(r.right - 140, ry, 120, 22), Text::Body, P().textDim, Align::Right, true);
+            ry += 26;
         }
-        Button(c, Rect(x + 20, r.bottom - 50, 130, 34), L"Review ›", i == 0, 500 + i);
+        if (s.groups.empty()) c.Text(L"Nothing found here.", Rect(x + 20, ry, gw - 40, 22), Text::Body, P().textFaint);
+        Button(c, Rect(x + 20, r.bottom - 50, 130, 34), L"Review \u203A", s.groups.empty() ? Btn::Disabled : i == 0 ? Btn::Primary : Btn::Secondary,
+            HotCleanReview + i);
     }
 }
 
-struct SysItem { const wchar_t* path; const wchar_t* label; const wchar_t* why; const wchar_t* fix; double reducible; };
-
 void PageSystem(Canvas& c, const D2D1_RECT_F& area)
 {
-    const ScanTree& t = *g.tree;
-    const std::wstring win = KnownFolder(CSIDL_WINDOWS);
-    const std::wstring sysRoot = VolumeOf(win);
-    if (_wcsicmp(VolumeOf(g.root).c_str(), sysRoot.c_str()) != 0 || g.root.size() > 3)
+    const SystemReport& sys = *g.system;
+    if (!sys.available)
     {
         EmptyState(c, area, 0xE770, L"Scan your system drive to see what Windows uses",
-            L"This view needs a whole-drive scan of " + sysRoot.substr(0, 2) + L". Folder scans don't include Windows files.");
+            L"This view needs a whole-drive scan of " + VolumeOf(KnownFolder(CSIDL_WINDOWS)).substr(0, 2) +
+            L". Use the drive chip at the top to switch.");
         return;
-    }
-    const SysItem items[] = {
-        { L"hiberfil.sys", L"Hibernation file", L"Holds memory contents for hibernate and fast startup.", L"Turn off hibernation", 1.0 },
-        { L"pagefile.sys", L"Page file", L"Virtual memory. Windows sizes it automatically.", L"Adjust virtual memory", 0.0 },
-        { L"swapfile.sys", L"Swap file", L"Used by Store apps when memory is tight.", L"Managed by Windows", 0.0 },
-        { L"Windows\\WinSxS", L"Component store (WinSxS)", L"Every Windows update keeps older components here.", L"Clean up components (DISM)", 0.25 },
-        { L"Windows\\System32\\DriverStore", L"Driver store", L"Copies of every installed driver.", L"Managed by Windows", 0.0 },
-        { L"Windows\\SoftwareDistribution", L"Windows Update cache", L"Downloaded update packages.", L"Disk Cleanup", 0.9 },
-        { L"System Volume Information", L"Restore points", L"Snapshots for System Restore (needs admin to measure).", L"Shrink restore points", 0.0 },
-        { L"Program Files", L"Installed apps", L"Programs you installed.", L"Apps & features", 0.0 },
-    };
-    u64 total = 0;
-    double reducible = 0;
-    std::vector<std::pair<const SysItem*, u64>> found;
-    for (const SysItem& it : items)
-    {
-        const u32 n = t.Find(JoinPath(g.root, it.path));
-        const u64 b = n == NoNode ? 0 : t.At(n).size;
-        found.push_back({ &it, b });
-        total += b;
-        reducible += static_cast<double>(b) * it.reducible;
     }
     const D2D1_RECT_F hero = { area.left, area.top, area.right, area.top + 110 };
     c.Card(hero, 16);
     c.FillRound(Rect(hero.left + 24, hero.top + 26, 56, 56), 16, P().protectedC.WithAlpha(0.16f));
     c.Icon(0xE72E, hero.left + 38, hero.top + 40, 28, P().protectedC);
-    c.Text(L"Windows itself uses " + FormatBytes(total), Rect(hero.left + 100, hero.top + 22, 700, 36), Text::Title, P().text);
-    c.Text(L"About " + FormatBytes(static_cast<u64>(reducible)) +
-        L" of that can be reduced safely with Windows' own tools. Never delete these files by hand.",
-        Rect(hero.left + 100, hero.top + 62, 900, 22), Text::Body, P().textDim);
+    c.Text(L"Windows itself uses " + FormatBytes(sys.total), Rect(hero.left + 100, hero.top + 22, 800, 36), Text::Title, P().text);
+    c.Text(L"About " + FormatBytes(sys.reducible) + L" of that can be reduced safely with Windows' own tools. Never delete these files by hand.",
+        Rect(hero.left + 100, hero.top + 62, 1000, 22), Text::Body, P().textDim);
     float y = hero.bottom + 16;
-    const float rowH = 58;
-    for (const auto& f : found)
+    const float rowH = (area.bottom - y) / static_cast<float>(std::max<size_t>(1, sys.items.size()));
+    const float rh = std::clamp(rowH, 40.0f, 58.0f);
+    for (size_t i = 0; i < sys.items.size(); ++i)
     {
-        if (y + rowH > area.bottom) break;
-        const D2D1_RECT_F r = { area.left, y, area.right, y + rowH - 8 };
+        const SystemItem& it = sys.items[i];
+        if (y + rh > area.bottom + 4) break;
+        const D2D1_RECT_F r = { area.left, y, area.right, y + rh - 6 };
         c.Card(r, 12);
-        c.Icon(0xE72E, r.left + 18, r.top + 17, 16, P().protectedC);
-        c.Text(f.first->label, Rect(r.left + 48, r.top + 7, 340, 20), Text::BodyStrong, P().text);
-        c.Text(f.first->why, Rect(r.left + 48, r.top + 27, 520, 18), Text::Caption, P().textDim);
-        c.Text(f.second ? FormatBytes(f.second) : std::wstring(L"not measured"), Rect(r.right - 470, r.top, 120, rowH - 8),
+        const float mid = (r.bottom - r.top) / 2;
+        c.Icon(0xE72E, r.left + 18, r.top + mid - 8, 16, P().protectedC);
+        c.Text(it.label, Rect(r.left + 48, r.top + mid - 20, 340, 20), Text::BodyStrong, P().text);
+        c.Text(it.why, Rect(r.left + 48, r.top + mid, 600, 18), Text::Caption, P().textDim);
+        c.Text(it.bytes ? FormatBytes(it.bytes) : std::wstring(L"not measured"), Rect(r.right - 470, r.top, 120, r.bottom - r.top),
             Text::BodyStrong, P().text, Align::Right, true);
-        const std::wstring fix = f.first->fix;
-        const float fw = c.Measure(fix, Text::CaptionStrong).width + 28;
-        const D2D1_RECT_F chip = Rect(r.right - 20 - fw, r.top + 11, fw, 28);
-        const bool action = f.first->reducible > 0 || wcscmp(f.first->fix, L"Managed by Windows") != 0;
-        c.FillRound(chip, 8, action ? P().accent.WithAlpha(0.14f) : P().surface2);
-        c.Text(fix, chip, Text::CaptionStrong, action ? P().accent : P().textDim, Align::Center, true);
-        Badge(c, r.right - 330, r.top + 14, Safety::Protected);
-        y += rowH;
+        Badge(c, r.right - 330, r.top + mid - 11, Safety::Protected);
+        const bool action = !it.command.empty();
+        const float fw = c.Measure(it.tool, Text::CaptionStrong).width + 28;
+        const D2D1_RECT_F chip = Rect(r.right - 20 - fw, r.top + mid - 14, fw, 28);
+        const int id = HotSysTool + static_cast<int>(i);
+        c.FillRound(chip, 8, action ? P().accent.WithAlpha(Hovered(id) ? 0.26f : 0.14f) : P().surface2);
+        c.Text(it.tool, chip, Text::CaptionStrong, action ? P().accent : P().textDim, Align::Center, true);
+        if (action) HotArea(chip, id);
+        y += rh;
     }
 }
 
 void PageInternals(Canvas& c, const D2D1_RECT_F& area)
 {
     const float colW = (area.right - area.left - 20) / 2;
-    // Cluster map (illustration of the used:free ratio; the exact bitmap needs admin).
     const D2D1_RECT_F cm = Rect(area.left, area.top, colW, 300);
     c.Card(cm, 16);
     c.Text(L"Cluster map", Rect(cm.left + 20, cm.top + 16, 300, 22), Text::BodyStrong, P().text);
     const u64 clusters = g.vol.totalClusters, freeC = g.vol.freeClusters;
-    c.Text(FormatCount(clusters) + L" clusters of " + FormatBytes(g.vol.bytesPerCluster) + L" · " +
-        FormatCount(freeC) + L" free", Rect(cm.left + 20, cm.top + 38, colW - 40, 18), Text::Caption, P().textDim);
+    c.Text(FormatCount(clusters) + L" clusters of " + FormatBytes(g.vol.bytesPerCluster) + L" \u00B7 " + FormatCount(freeC) + L" free",
+        Rect(cm.left + 20, cm.top + 38, colW - 40, 18), Text::Caption, P().textDim);
     const int cols = 48, rows = 12;
     const float cell = std::min((colW - 40) / cols, 13.0f);
     const int used = clusters ? static_cast<int>(std::lround(static_cast<double>(clusters - freeC) / clusters * cols * rows)) : 0;
@@ -626,23 +853,21 @@ void PageInternals(Canvas& c, const D2D1_RECT_F& area)
     for (int i = 0; i < cols * rows; ++i)
     {
         seed = seed * 1103515245u + 12345u;
-        // Mostly-front-loaded allocation with scattered holes, like a real NTFS volume.
         const bool isUsed = i < used ? ((seed >> 16) % 23 != 0) : ((seed >> 16) % 31 == 0);
         const float x = cm.left + 20 + static_cast<float>(i % cols) * cell, y = cm.top + 68 + static_cast<float>(i / cols) * cell;
         c.FillRound(Rect(x, y, cell - 2, cell - 2), 2, isUsed ? P().accent.WithAlpha(0.75f) : P().freeSpace);
     }
     c.Text(L"Each square is about " + FormatBytes(clusters ? clusters * g.vol.bytesPerCluster / (cols * rows) : 0) +
-        L". Teal is in use, grey is free. The exact layout needs administrator rights; this shows the real ratio.",
+        L". Teal is in use, grey is free (real ratio; the exact layout needs administrator rights).",
         Rect(cm.left + 20, cm.bottom - 52, colW - 40, 40), Text::Caption, P().textDim);
 
-    // File layout: extents of the largest file
     const D2D1_RECT_F fl = Rect(area.left + colW + 20, area.top, colW, 300);
     c.Card(fl, 16);
-    c.Text(L"How a file sits on disk", Rect(fl.left + 20, fl.top + 16, colW - 40, 22), Text::BodyStrong, P().text);
+    c.Text(L"How a file sits on disk", Rect(fl.left + 20, fl.top + 16, colW - 180, 22), Text::BodyStrong, P().text);
+    Button(c, Rect(fl.right - 150, fl.top + 12, 130, 30), L"Choose a file\u2026", Btn::Secondary, HotBrowseFile);
     const FileInternals& f = g.bigFile;
     const size_t slash = f.path.find_last_of(L'\\');
-    c.Text(slash == std::wstring::npos ? f.path : f.path.substr(slash + 1), Rect(fl.left + 20, fl.top + 38, colW - 40, 18),
-        Text::Caption, P().textDim);
+    c.Text(slash == std::wstring::npos ? f.path : f.path.substr(slash + 1), Rect(fl.left + 20, fl.top + 42, colW - 40, 18), Text::Caption, P().textDim);
     const D2D1_RECT_F strip = Rect(fl.left + 20, fl.top + 70, colW - 40, 34);
     c.FillRound(strip, 6, P().surface2);
     u64 totalClusters = 0;
@@ -656,9 +881,11 @@ void PageInternals(Canvas& c, const D2D1_RECT_F& area)
             i % 2 ? P().Kind(gfx::FileKind::DiskImages) : P().Kind(gfx::FileKind::Programs));
         sx += w;
     }
-    const std::wstring verdict = f.fragments <= 1 ? L"Contiguous: stored in one piece." :
-        Fmt(L"Fragmented: stored in %llu pieces across the disk.", f.fragments);
-    c.Text(verdict, Rect(fl.left + 20, strip.bottom + 10, colW - 40, 20), Text::BodyStrong, f.fragments <= 1 ? P().safe : P().review);
+    std::wstring verdict = f.error ? L"Couldn't read this file's layout: " + ErrorText(f.error) :
+        f.resident ? L"Tiny file: stored inside its MFT record, no clusters of its own." :
+        f.fragments <= 1 ? L"Contiguous: stored in one piece." : Fmt(L"Fragmented: stored in %llu pieces across the disk.", f.fragments);
+    c.Text(verdict, Rect(fl.left + 20, strip.bottom + 10, colW - 40, 20), Text::BodyStrong,
+        f.error ? P().caution : f.fragments <= 1 ? P().safe : P().review);
     const wchar_t* labels[] = { L"Logical size", L"Size on disk", L"Slack" };
     const u64 vals[] = { f.logicalSize, f.allocatedSize, f.slack };
     for (int i = 0; i < 3; ++i)
@@ -669,12 +896,12 @@ void PageInternals(Canvas& c, const D2D1_RECT_F& area)
     }
     c.Text(Explain(Metric::Extents), Rect(fl.left + 20, fl.bottom - 70, colW - 40, 60), Text::Caption, P().textDim);
 
-    // Explanation cards
     struct Card { const wchar_t* title; std::wstring value; Metric m; };
     const Card cards[] = {
         { L"Cluster size", FormatBytes(g.vol.bytesPerCluster), Metric::ClusterSize },
         { L"Slack space", FormatBytes(g.slack.totalSlack), Metric::Slack },
-        { L"Master File Table", g.vol.ntfsData ? FormatCount(g.vol.mftRecordCount) + L" records" : std::wstring(L"Needs admin"), Metric::Mft },
+        { L"Master File Table", g.vol.ntfsData ? FormatCount(g.vol.mftRecordCount) + L" records \u00B7 " + FormatBytes(g.vol.mftValidDataLength) :
+          std::wstring(L"Run as admin to read"), Metric::Mft },
     };
     const float cw = (area.right - area.left - 40) / 3;
     for (int i = 0; i < 3; ++i)
@@ -694,7 +921,7 @@ void PageHistory(Canvas& c, const D2D1_RECT_F& area)
     const D2D1_RECT_F gc = { area.left, area.top, area.right, area.top + h1 };
     c.Card(gc, 16);
     c.Text(L"Growth since the last scan", Rect(gc.left + 20, gc.top + 16, 500, 22), Text::BodyStrong, P().text);
-    if (g.report && g.report->hasSnapshot && !g.report->growth.empty())
+    if (g.report->hasSnapshot && !g.report->growth.empty())
     {
         long long maxDelta = 1;
         for (const GrowthEntry& e : g.report->growth) maxDelta = std::max(maxDelta, std::llabs(e.delta));
@@ -705,67 +932,42 @@ void PageHistory(Canvas& c, const D2D1_RECT_F& area)
             c.Text(e.path, Rect(gc.left + 20, y, 420, 22), Text::Body, P().text, Align::Left, true);
             const float bw = static_cast<float>(std::llabs(e.delta)) / static_cast<float>(maxDelta) * (gc.right - gc.left - 640);
             c.FillRound(Rect(gc.left + 460, y + 6, std::max(3.0f, bw), 10), 5, e.delta > 0 ? P().review : P().safe);
-            c.Text((e.delta > 0 ? L"+" : L"−") + FormatBytes(static_cast<u64>(std::llabs(e.delta))), Rect(gc.right - 160, y, 140, 22),
+            c.Text((e.delta > 0 ? L"+" : L"\u2212") + FormatBytes(static_cast<u64>(std::llabs(e.delta))), Rect(gc.right - 160, y, 140, 22),
                 Text::Body, P().textDim, Align::Right, true);
             y += 32;
         }
     }
     else
     {
-        // Skeleton bars hint at what will appear.
         for (int i = 0; i < 5; ++i)
-            c.FillRound(Rect(gc.left + 40, gc.top + 70 + static_cast<float>(i) * 30, 120.0f + static_cast<float>((i * 97) % 260), 12), 6,
-                P().surface2);
+            c.FillRound(Rect(gc.left + 40, gc.top + 70 + static_cast<float>(i) * 30, 120.0f + static_cast<float>((i * 97) % 260), 12), 6, P().surface2);
         EmptyState(c, { gc.left + 300, gc.top + 20, gc.right, gc.bottom }, 0xE81C, L"First scan of " + g.volume.substr(0, 2),
-            L"Growth appears after your next scan. Snapshots are saved on another drive, never on a full one.");
+            L"Growth appears after your next scan. Snapshots are saved on a drive that isn't full.");
     }
     const D2D1_RECT_F nc = { area.left, gc.bottom + 16, area.right, area.bottom };
     c.Card(nc, 16);
     c.Text(L"Low-space alerts", Rect(nc.left + 20, nc.top + 16, 500, 22), Text::BodyStrong, P().text);
     const bool on = IsStartWithWindows();
     Badge(c, nc.left + 180, nc.top + 16, on ? Safety::Safe : Safety::Review);
-    c.Text(on ? L"Alerts are on. You'll get a quiet notification when a drive crosses 50, 20, 10, 5, 3, 2, 1 GB or 512 MB." :
-        L"Alerts are off. Turn them on in Settings to get a quiet notification before a drive fills up.",
+    c.Text(on ? L"Alerts are on: a quiet notification when a drive crosses 50, 20, 10, 5, 3, 2, 1 GB or 512 MB." :
+        L"Alerts are off. Turn them on in Settings to be warned before a drive fills up.",
         Rect(nc.left + 20, nc.top + 46, nc.right - nc.left - 40, 20), Text::Body, P().textDim);
-    c.Text(L"No alerts yet.", Rect(nc.left + 20, nc.top + 76, 400, 20), Text::Caption, P().textFaint);
-}
-
-void Toggle(Canvas& c, float x, float y, bool on)
-{
-    c.FillRound(Rect(x, y, 40, 20), 10, on ? P().accent : P().surface3);
-    c.Circle(on ? x + 30 : x + 10, y + 10, 7, on ? P().accentInk : P().textDim);
-}
-
-void Segmented(Canvas& c, float x, float y, const std::vector<std::wstring>& items, int sel)
-{
-    float w = 0;
-    for (const auto& s : items) w += c.Measure(s, Text::BodyStrong).width + 28;
-    c.FillRound(Rect(x, y, w + 6, 32), 8, P().surface2);
-    float cx = x + 3;
-    for (size_t i = 0; i < items.size(); ++i)
-    {
-        const float iw = c.Measure(items[i], Text::BodyStrong).width + 28;
-        if (static_cast<int>(i) == sel) c.FillRound(Rect(cx, y + 3, iw, 26), 6, P().surface1);
-        c.Text(items[i], Rect(cx, y + 3, iw, 26), Text::BodyStrong, static_cast<int>(i) == sel ? P().text : P().textDim, Align::Center, true);
-        cx += iw;
-    }
 }
 
 void PageSettings(Canvas& c, const D2D1_RECT_F& area)
 {
     Settings& st = Settings::Get();
-    const std::wstring work = PickWorkVolume(VolumeOf(g.root), st.rescue);
     struct Row { const wchar_t* title; const wchar_t* sub; };
     const Row rows[] = {
-        { L"Low-space alerts", L"A quiet notification when a drive crosses a threshold. Runs in the tray using about 2 MB." },
+        { L"Low-space alerts", L"A quiet notification when a drive crosses a threshold. Starts with Windows, runs in the tray (~2 MB)." },
         { L"Alert thresholds", L"Notify when free space drops below these levels." },
         { L"Reserve file", L"Space set aside on the system drive. Release it in Rescue Mode to get Windows breathing again." },
         { L"Work volume", L"Where quarantine, undo logs and snapshots go, so a full drive is never written to." },
-        { L"Scan threads", L"More threads scan faster on SSDs. Rescue Mode uses at most 4." },
+        { L"Scan threads", L"More threads scan faster on SSDs. Rescue Mode uses at most 4. Applies to the next scan." },
         { L"Theme", L"Follows Windows unless you choose one." },
     };
     const float rowH = 76;
-    const D2D1_RECT_F card = { area.left, area.top, std::min(area.right, area.left + 980), area.top + rowH * 6 + 8 };
+    const D2D1_RECT_F card = { area.left, area.top, std::min(area.right, area.left + 1040), area.top + rowH * 6 + 8 };
     c.Card(card, 16);
     for (int i = 0; i < 6; ++i)
     {
@@ -776,7 +978,7 @@ void PageSettings(Canvas& c, const D2D1_RECT_F& area)
         const float rx = card.left + 580;
         switch (i)
         {
-        case 0: Toggle(c, card.right - 64, y + 26, IsStartWithWindows()); break;
+        case 0: Toggle(c, card.right - 64, y + 26, IsStartWithWindows(), HotAlerts); break;
         case 1:
         {
             const wchar_t* th[] = { L"50", L"20", L"10", L"5", L"3", L"2", L"1 GB", L"512 MB" };
@@ -790,37 +992,227 @@ void PageSettings(Canvas& c, const D2D1_RECT_F& area)
             }
             break;
         }
-        case 2: Segmented(c, rx, y + 22, { L"256 MB", L"512 MB", L"1 GB", L"2 GB" }, 1); break;
+        case 2:
+        {
+            const u64 sizes[] = { 256 * MiB, 512 * MiB, 1 * GiB, 2 * GiB };
+            int sel = 1;
+            for (int k = 0; k < 4; ++k) if (st.rescue.reserveSize == sizes[k]) sel = k;
+            Segmented(c, rx, y + 22, { L"256 MB", L"512 MB", L"1 GB", L"2 GB" }, sel, HotReserveSize);
+            const ReserveStatus rs = QueryReserve();
+            Button(c, Rect(card.right - 190, y + 22, 166, 32), rs.exists ? L"Release (" + FormatBytes(rs.size) + L")" : std::wstring(L"Create now"),
+                Btn::Secondary, HotReserveAction);
+            break;
+        }
         case 3:
         {
-            const std::wstring s = work.empty() ? std::wstring(L"No other drive — kept in memory") : work.substr(0, 2) + L"  ·  automatic";
+            const std::wstring auto_ = PickWorkVolume(g.volume, st.rescue);
+            const std::wstring s = !st.rescue.workVolumeOverride.empty() ? st.rescue.workVolumeOverride.substr(0, 2) + L"  \u00B7  chosen" :
+                auto_.empty() ? std::wstring(L"No other drive \u2014 kept in memory") : auto_.substr(0, 2) + L"  \u00B7  automatic";
             const D2D1_RECT_F r = Rect(rx, y + 22, 300, 32);
-            c.FillRound(r, 8, P().surface2);
+            c.FillRound(r, 8, Hovered(HotWorkVolume) ? P().surface3 : P().surface2);
             c.StrokeRound(r, 8, P().stroke);
             c.Text(s, Rect(r.left + 12, r.top, 260, 32), Text::Body, P().text, Align::Left, true);
             c.Icon(0xE70D, r.right - 28, r.top + 9, 14, P().textDim);
+            HotArea(r, HotWorkVolume);
             break;
         }
         case 4:
         {
             const D2D1_RECT_F r = Rect(rx, y + 22, 132, 32);
             c.FillRound(r, 8, P().surface2);
-            c.Text(L"−", Rect(r.left, r.top, 36, 32), Text::BodyStrong, P().textDim, Align::Center, true);
-            c.Text(Fmt(L"%d", g.tree ? g.tree->threadsUsed : 8), Rect(r.left + 36, r.top, 60, 32), Text::BodyStrong, P().text, Align::Center, true);
-            c.Text(L"+", Rect(r.right - 36, r.top, 36, 32), Text::BodyStrong, P().textDim, Align::Center, true);
+            const int threads = g.threads ? g.threads : static_cast<int>(std::min(8u, std::max(1u, std::thread::hardware_concurrency())));
+            c.Text(L"\u2212", Rect(r.left, r.top, 36, 32), Text::BodyStrong, P().text, Align::Center, true);
+            c.Text(Fmt(L"%d", threads), Rect(r.left + 36, r.top, 60, 32), Text::BodyStrong, P().text, Align::Center, true);
+            c.Text(L"+", Rect(r.right - 36, r.top, 36, 32), Text::BodyStrong, P().text, Align::Center, true);
+            HotArea(Rect(r.left, r.top, 36, 32), HotThreadsMinus);
+            HotArea(Rect(r.right - 36, r.top, 36, 32), HotThreadsPlus);
             break;
         }
-        case 5: Segmented(c, rx, y + 22, { L"System", L"Light", L"Dark" }, g.opt.theme); break;
+        case 5: Segmented(c, rx, y + 22, { L"System", L"Light", L"Dark" }, g.opt.theme, HotTheme); break;
         }
     }
-    c.Text(L"SpaceRescue · GPL-3.0 · built on ideas and code from WinDirStat (windirstat.net)",
-        Rect(area.left, card.bottom + 16, 800, 18), Text::Caption, P().textFaint);
+    c.Text(L"Settings: " + (st.WritesSuppressed() ? std::wstring(L"kept in memory (drive is full)") : st.Location()) +
+        L"  \u00B7  SpaceRescue \u00B7 GPL-3.0 \u00B7 built on WinDirStat (windirstat.net)",
+        Rect(area.left, card.bottom + 16, 1000, 18), Text::Caption, P().textFaint);
 }
+
+// --- Review list -----------------------------------------------------------------
+
+void PageReviewList(Canvas& c, const D2D1_RECT_F& area)
+{
+    Button(c, Rect(area.left, area.top - 4, 90, 30), L"\u2190 Back", Btn::Secondary, HotRevBack);
+    c.Text(g.reviewTitle, Rect(area.left + 104, area.top - 6, 700, 34), Text::Section, P().text, Align::Left, true);
+    u64 selBytes = 0;
+    size_t selCount = 0;
+    bool anyLocked = false;
+    for (const ReviewItem& it : g.review)
+        if (it.checked) { selBytes += g.tree->At(it.node).size; ++selCount; anyLocked |= it.locked; }
+    // List
+    const D2D1_RECT_F list = { area.left, area.top + 40, area.right, area.bottom - 120 };
+    c.Card(list, 12);
+    const float rowH = 40;
+    const float maxScroll = std::max(0.0f, static_cast<float>(g.review.size()) * rowH - (list.bottom - list.top - 16));
+    g.reviewScroll = std::clamp(g.reviewScroll, 0.0f, maxScroll);
+    c.PushClip(gfx::Inset(list, 2));
+    float y = list.top + 8 - g.reviewScroll;
+    for (size_t i = 0; i < g.review.size(); ++i, y += rowH)
+    {
+        if (y + rowH < list.top || y > list.bottom) continue;
+        const ReviewItem& it = g.review[i];
+        const D2D1_RECT_F row = { list.left + 8, y, list.right - 8, y + rowH - 4 };
+        if (Hovered(HotRevItem + static_cast<int>(i))) c.FillRound(row, 8, P().surface2);
+        // Checkbox
+        const D2D1_RECT_F box = Rect(row.left + 10, y + 9, 18, 18);
+        if (it.locked) { c.Icon(0xE72E, box.left + 1, box.top + 1, 16, P().protectedC); }
+        else if (it.checked) { c.FillRound(box, 4, P().accent); c.Icon(0xE73E, box.left + 2, box.top + 2, 14, P().accentInk); }
+        else c.StrokeRound(box, 4, P().textDim, 1.5f);
+        const ScanTree& t = *g.tree;
+        c.Text(t.Name(it.node), Rect(row.left + 40, y, 380, 20), Text::BodyStrong, P().text, Align::Left, false);
+        c.Text(it.group + L"  \u00B7  " + t.Path(t.At(it.node).parent), Rect(row.left + 40, y + 18, row.right - row.left - 360, 18),
+            Text::Caption, P().textDim);
+        Badge(c, row.right - 260, y + 7, it.safety);
+        c.Text(FormatAge(t.At(it.node).writeTime), Rect(row.right - 170, y, 80, 36), Text::Caption, P().textDim, Align::Right, true);
+        c.Text(FormatBytes(t.At(it.node).size), Rect(row.right - 90, y, 80, 36), Text::BodyStrong, P().text, Align::Right, true);
+        if (!it.locked) HotArea(row, HotRevItem + static_cast<int>(i));
+    }
+    c.PopClip();
+    if (g.review.empty()) EmptyState(c, list, 0xE73E, L"Nothing left here", L"Everything in this group has been handled.");
+
+    // Action bar
+    const float by = area.bottom - 108;
+    c.Text(FormatCount(selCount) + L" selected \u00B7 " + FormatBytes(selBytes) + (g.volTotal ? L" (" +
+        FormatPercent(static_cast<double>(selBytes) / static_cast<double>(g.volTotal)) + L" of " + g.volume.substr(0, 2) + L")" : L""),
+        Rect(area.left, by, 600, 24), Text::BodyStrong, P().text, Align::Left, true);
+    if (const u32 bin = g.tree->Find(JoinPath(g.volume, L"$Recycle.Bin")); bin != NoNode && g.tree->At(bin).size && g.reviewTitle == L"Windows temp")
+        Button(c, Rect(area.right - 470, by - 4, 230, 30), L"Empty Recycle Bin (" + FormatBytes(g.tree->At(bin).size) + L")…",
+            g.busy ? Btn::Disabled : Btn::Danger, HotRevEmptyBin);
+    Button(c, Rect(area.right - 230, by - 4, 110, 30), L"Select all", Btn::Secondary, HotRevAll);
+    Button(c, Rect(area.right - 110, by - 4, 110, 30), L"Select none", Btn::Secondary, HotRevNone);
+    const std::wstring work = PickWorkVolume(g.volume, Settings::Get().rescue);
+    const bool can = selCount && !g.busy;
+    float bx = area.left;
+    auto action = [&](const std::wstring& label, Btn kind, int id, float w) {
+        Button(c, Rect(bx, by + 34, w, 38), label, can || id == HotRevOpen ? kind : Btn::Disabled, id);
+        bx += w + 10;
+    };
+    action(L"Move to quarantine" + (work.empty() ? std::wstring() : L" (" + work.substr(0, 2) + L")"), work.empty() ? Btn::Disabled : Btn::Primary,
+        HotRevQuarantine, 230);
+    action(L"Move to Recycle Bin", Btn::Secondary, HotRevRecycle, 180);
+    action(L"Compress (NTFS)", Btn::Secondary, HotRevCompress, 160);
+    action(L"Open location", Btn::Secondary, HotRevOpen, 140);
+    action(L"Delete permanently\u2026", anyLocked ? Btn::Disabled : Btn::Danger, HotRevDelete, 190);
+    c.Text(g.busy ? L"Working\u2026" : work.empty() ?
+        L"Quarantine needs another drive. The Recycle Bin keeps files on the same drive, so it frees nothing until you empty it." :
+        L"Quarantine copies to " + work.substr(0, 2) + L", checks the copy, then removes the original: space is freed now and you can undo. The Recycle Bin frees nothing until emptied.",
+        Rect(area.left, by + 80, area.right - area.left, 18), Text::Caption, P().textDim);
+}
+
+// --- Command palette ---------------------------------------------------------------
+
+void BuildPalette()
+{
+    g.items.clear();
+    g.paletteSel = 0;
+    std::wstring q = ToLower(g.query);
+    auto add = [&](const std::wstring& title, const std::wstring& detail, wchar_t icon, std::function<void()> run) {
+        if (q.empty() || ContainsI(title, q.c_str()) || ContainsI(detail, q.c_str())) g.items.push_back({ title, detail, icon, std::move(run) });
+    };
+    // A typed or pasted path ("C:\Users\me\Downloads") jumps straight there.
+    if (g.query.size() >= 2 && g.query[1] == L':')
+    {
+        const std::wstring path = g.query;
+        g.items.push_back({ L"Go to " + path, L"Enter", 0xE8DA, [path] { GoToPath(path); } });
+    }
+    for (int i = 0; i < 8; ++i) add(L"Go to " + std::wstring(PageNames[i]), Fmt(L"Ctrl+%d", i + 1), PageIcons[i], [i] { SetPage(i); });
+    for (const DriveInfo& d : EnumerateDrives(Settings::Get().rescue))
+    {
+        const std::wstring r = d.root;
+        add(L"Scan " + d.root.substr(0, 2) + L" " + d.label, FormatBytes(d.free) + L" free of " + FormatBytes(d.total), 0xEDA2, [r] { StartScan(r); });
+    }
+    add(L"Rescan", g.root, 0xE72C, [] { StartScan(g.root); });
+    add(L"Choose a folder to scan\u2026", L"Pick any folder", 0xE8B7, [] { PostMessageW(g.hwnd, WM_COMMAND, HotDriveChip, 1); });
+    add(L"Review everything that can be freed", L"Clean up", 0xE74D, [] { SetPage(3); });
+    add(L"Open Disk Cleanup", L"Windows tool", 0xE74D, [] { ShellExecuteW(nullptr, L"open", L"cleanmgr.exe", nullptr, nullptr, SW_SHOWNORMAL); });
+    add(L"Open Storage settings", L"Windows Settings", 0xE713, [] { ShellExecuteW(nullptr, L"open", L"ms-settings:storagesense", nullptr, nullptr, SW_SHOWNORMAL); });
+    // Files and folders by name (min 2 characters), largest first.
+    if (g.tree && q.size() >= 2)
+    {
+        std::vector<u32> hits;
+        const ScanTree& t = *g.tree;
+        for (u32 i = 1; i < t.Count(); ++i)
+            if (t.At(i).parent != NoNode && t.NameContainsI(i, q)) hits.push_back(i);
+        std::sort(hits.begin(), hits.end(), [&t](u32 a, u32 b) { return t.At(a).size > t.At(b).size; });
+        for (size_t k = 0; k < hits.size() && k < 30; ++k)
+        {
+            const u32 n = hits[k];
+            g.items.push_back({ t.Name(n), FormatBytes(t.At(n).size) + L"  \u00B7  " + t.Path(t.At(n).parent), t.IsDir(n) ? wchar_t(0xE8B7) : wchar_t(0xE7C3),
+                [n] {
+                    const ScanTree& tr = *g.tree;
+                    g.exploreRoot = tr.IsDir(n) ? n : tr.At(n).parent;
+                    g.highlight = tr.IsDir(n) ? NoNode : n;
+                    SetPage(1);
+                } });
+        }
+    }
+}
+
+void DrawPalette(Canvas& c)
+{
+    if (!g.palette) return;
+    c.Fill(Rect(0, 0, c.Width(), c.Height()), Color(0x000000, P().dark ? 0.45f : 0.25f));
+    const float w = std::min(720.0f, c.Width() - 80), x = (c.Width() - w) / 2, y = 70;
+    const float h = std::min(520.0f, c.Height() - 140);
+    const D2D1_RECT_F box = Rect(x, y, w, h);
+    c.Shadow(box, 14, 32, 12, 0.4f);
+    c.FillRound(box, 14, P().surface2);
+    c.StrokeRound(box, 14, P().stroke);
+    HotArea(box, HotPaletteBox);
+    c.Icon(0xE721, x + 18, y + 18, 20, P().textDim);
+    c.Text(g.query.empty() ? std::wstring(L"Search files and folders, or type a command\u2026") : g.query + L"\u2502",
+        Rect(x + 50, y + 8, w - 70, 40), Text::Section, g.query.empty() ? P().textFaint : P().text, Align::Left, true);
+    c.Line(x + 12, y + 56, x + w - 12, y + 56, P().stroke);
+    float ry = y + 64;
+    const float rowH = 44;
+    const int visible = static_cast<int>((h - 72) / rowH);
+    const int first = std::max(0, g.paletteSel - visible + 1);
+    for (int i = first; i < static_cast<int>(g.items.size()) && i < first + visible; ++i)
+    {
+        const PaletteItem& it = g.items[static_cast<size_t>(i)];
+        const D2D1_RECT_F row = Rect(x + 8, ry, w - 16, rowH - 4);
+        if (i == g.paletteSel) c.FillRound(row, 8, P().accent.WithAlpha(0.18f));
+        else if (Hovered(HotPaletteItem + i)) c.FillRound(row, 8, P().surface3);
+        c.Icon(it.icon, x + 22, ry + 12, 16, i == g.paletteSel ? P().accent : P().textDim);
+        c.Text(it.title, Rect(x + 52, ry + 2, w * 0.45f, 36), Text::Body, P().text, Align::Left, true);
+        c.Text(it.detail, Rect(x + 52 + w * 0.45f, ry + 2, w * 0.55f - 76, 36), Text::Caption, P().textDim, Align::Right, true);
+        HotArea(row, HotPaletteItem + i);
+        ry += rowH;
+    }
+    if (g.items.empty()) c.Text(L"No matches. Try another name.", Rect(x + 52, ry + 6, w - 80, 30), Text::Body, P().textFaint);
+    c.Text(L"\u2191\u2193 to move \u00B7 Enter to open \u00B7 Esc to close", Rect(x, y + h + 8, w, 18), Text::Caption, Color(0xFFFFFF, 0.8f), Align::Center);
+}
+
+void OpenPalette()
+{
+    g.palette = true;
+    g.query.clear();
+    BuildPalette();
+    Invalidate();
+}
+
+void RunPaletteItem(int i)
+{
+    if (i < 0 || i >= static_cast<int>(g.items.size())) return;
+    auto run = g.items[static_cast<size_t>(i)].run;
+    g.palette = false;
+    run();
+    Invalidate();
+}
+
+// --- Paint -----------------------------------------------------------------------
 
 void DrawScanning(Canvas& c, const D2D1_RECT_F& area)
 {
     const ScanProgress p = g.scanner ? g.scanner->Progress() : ScanProgress();
-    // Quick wins (right column): sized in parallel, answer within seconds.
     const float qw = 320;
     const float w = std::min(700.0f, area.right - area.left - qw - 40);
     const float x = area.left + (area.right - area.left - w - qw - 40) / 2;
@@ -831,7 +1223,7 @@ void DrawScanning(Canvas& c, const D2D1_RECT_F& area)
         c.Card(card, 16);
         Overline(c, L"Quick wins found so far", qx + 20, card.top + 18, qw - 40);
         c.Text(FormatBytes(g.quick->SafeTotal()), Rect(qx + 20, card.top + 36, qw - 40, 40), Text::Number, P().safe);
-        c.Text(Fmt(L"safe to free · %.1f s", (GetTickCount() - g.scanStart) / 1000.0), Rect(qx + 20, card.top + 70, qw - 40, 18),
+        c.Text(Fmt(L"safe to free \u00B7 %.1f s", (GetTickCount() - g.scanStart) / 1000.0), Rect(qx + 20, card.top + 70, qw - 40, 18),
             Text::Caption, P().textDim);
         float qy = card.top + 100;
         for (const QuickWin& q : g.quick->Snapshot())
@@ -845,7 +1237,7 @@ void DrawScanning(Canvas& c, const D2D1_RECT_F& area)
     }
     float y = area.top + 40;
     Overline(c, L"Scanning " + g.root, x, y, w);
-    c.Text(FormatCount(p.files) + L" files · " + FormatBytes(p.bytes), Rect(x, y + 20, w, 56), Text::Hero, P().text);
+    c.Text(FormatCount(p.files) + L" files \u00B7 " + FormatBytes(p.bytes), Rect(x, y + 20, w, 56), Text::Hero, P().text);
     c.Text(L"Biggest folders so far. This list fills in live, so you don't have to wait for the whole scan.",
         Rect(x, y + 80, w, 20), Text::Body, P().textDim);
     y += 120;
@@ -872,9 +1264,9 @@ void Paint(HDC printDc = nullptr)
     c.Clear(P().base);
     DrawRail(c);
     DrawTopBar(c);
-    // Page transition: fade + 8 px slide (motion "standard").
+    const float banner = DrawBanner(c, Top + 12);
     const float t = gfx::Ease(g.pageStart, 200);
-    const D2D1_RECT_F area = { Rail + Margin, Top + 16 + (1 - t) * 8, c.Width() - Margin, c.Height() - 24 };
+    const D2D1_RECT_F area = { Rail + Margin, Top + 16 + banner + (1 - t) * 8, c.Width() - Margin, c.Height() - 24 };
     if (g.scanning) DrawScanning(c, area);
     else
     {
@@ -887,39 +1279,195 @@ void Paint(HDC printDc = nullptr)
         case 4: PageSystem(c, area); break;
         case 5: PageInternals(c, area); break;
         case 6: PageHistory(c, area); break;
-        default: PageSettings(c, area); break;
+        case 7: PageSettings(c, area); break;
+        default: PageReviewList(c, area); break;
         }
-        if (g.tree)
-            c.Text(FormatCount(g.tree->fileCount) + L" files · scanned in " + Fmt(L"%.1f s", g.tree->scanMillis / 1000.0) +
-                L" · " + FormatBytes(PeakWorkingSet()) + L" peak memory", Rect(c.Width() - 420, c.Height() - 20, 400, 16),
-                Text::Caption, P().textFaint, Align::Right);
+        c.Text(FormatCount(g.tree->fileCount) + L" files \u00B7 scanned in " + Fmt(L"%.1f s", g.tree->scanMillis / 1000.0) +
+            (g.tree->usedMft ? L" (MFT)" : L"") + L" \u00B7 " + FormatBytes(PeakWorkingSet()) + L" peak memory",
+            Rect(c.Width() - 440, c.Height() - 20, 420, 16), Text::Caption, P().textFaint, Align::Right);
     }
+    DrawToast(c);
+    DrawPalette(c);
     if (t < 1 || (g.unfoldStart && gfx::Ease(g.unfoldStart, 700, true) < 1)) SetTimer(g.hwnd, TimerAnim, 16, nullptr);
     else KillTimer(g.hwnd, TimerAnim);
     c.End();
 }
 
-void SetPage(int p)
+// --- Actions -----------------------------------------------------------------------
+
+void ApplyTheme()
 {
-    if (p == g.page) return;
-    g.page = std::clamp(p, 0, 7);
-    g.pageStart = GetTickCount();
-    g.hoverSeg = -1;
-    if (g.page == 0 || g.page == 2)
-    {
-        g.unfoldStart = GetTickCount();
-        g.sunRoot = g.tree ? g.tree->Root() : 0;
-        if (g.tree) g.sun.Build(*g.tree, g.sunRoot, g.page == 0 && g.root.size() <= 3 ? g.volFree : 0, g.page == 0 ? 3 : 5);
-    }
-    InvalidateRect(g.hwnd, nullptr, FALSE);
+    g.pal = g.opt.theme == 1 ? &gfx::Light() : g.opt.theme == 2 ? &gfx::Dark() : (gfx::SystemPrefersDark() ? &gfx::Dark() : &gfx::Light());
+    const BOOL dark = P().dark ? TRUE : FALSE;
+    DwmSetWindowAttribute(g.hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof dark);
+    const COLORREF caption = RGB(static_cast<int>(P().base.r * 255), static_cast<int>(P().base.g * 255), static_cast<int>(P().base.b * 255));
+    DwmSetWindowAttribute(g.hwnd, 35 /* DWMWA_CAPTION_COLOR */, &caption, sizeof caption);
+    g.treemapW = 0; // colours changed
+    Invalidate();
 }
 
-void StartScan()
+Nav Current() { return { g.page, g.exploreRoot, g.highlight, g.sunRoot, g.mapMode }; }
+
+// Applies a navigation state without touching the history.
+void ApplyNav(const Nav& n)
 {
+    const bool pageChanged = n.page != g.page;
+    const bool sunChanged = n.sunRoot != g.sunRoot || n.mapMode != g.mapMode;
+    g.page = std::clamp(n.page, 0, PageReview);
+    g.exploreRoot = n.exploreRoot;
+    g.highlight = n.selected;
+    g.sunRoot = n.sunRoot;
+    g.mapMode = n.mapMode;
+    if (pageChanged) g.pageStart = GetTickCount();
+    g.hoverSeg = -1;
+    g.hoverTile = NoNode;
+    if (g.tree && !g.scanning)
+    {
+        const bool driveRoot = g.root.size() <= 3;
+        if (g.page == 0 && pageChanged)
+        {
+            g.sun.Build(*g.tree, g.tree->Root(), driveRoot ? g.volFree : 0, 3);
+            g.unfoldStart = GetTickCount();
+        }
+        else if (g.page == 2 && (pageChanged || sunChanged))
+        {
+            g.sun.Build(*g.tree, g.sunRoot, 0, 5);
+            g.unfoldStart = GetTickCount();
+        }
+        if (g.page == 1 && g.highlight != NoNode) Reveal(g.highlight);
+    }
+    Invalidate();
+}
+
+// Navigates and records history (Back/Forward). Selection-only changes don't create history entries.
+void Go(const Nav& to)
+{
+    if (g.scanning) { g.page = to.page; Invalidate(); return; }
+    const Nav cur = Current();
+    if (cur.page == to.page && cur.exploreRoot == to.exploreRoot && cur.sunRoot == to.sunRoot && cur.mapMode == to.mapMode)
+    {
+        g.highlight = to.selected;
+        if (g.page == 1 && to.selected != NoNode) Reveal(to.selected);
+        Invalidate();
+        return;
+    }
+    g.back.push_back(cur);
+    if (g.back.size() > 200) g.back.erase(g.back.begin());
+    g.forward.clear();
+    if (to.exploreRoot != cur.exploreRoot) g.exploreScroll = 0;
+    ApplyNav(to);
+}
+
+void GoBack()
+{
+    if (g.back.empty() || g.scanning) return;
+    g.forward.push_back(Current());
+    const Nav n = g.back.back();
+    g.back.pop_back();
+    g.exploreScroll = 0;
+    ApplyNav(n);
+}
+
+void GoForward()
+{
+    if (g.forward.empty() || g.scanning) return;
+    g.back.push_back(Current());
+    const Nav n = g.forward.back();
+    g.forward.pop_back();
+    g.exploreScroll = 0;
+    ApplyNav(n);
+}
+
+void SetPage(int p)
+{
+    Nav n = Current();
+    n.page = p;
+    Go(n);
+}
+
+// Opens a node in Explore: folders become the current folder, files get selected inside their folder.
+void ExploreTo(u32 node)
+{
+    const ScanTree& t = *g.tree;
+    Nav n = Current();
+    n.page = 1;
+    n.exploreRoot = t.IsDir(node) ? node : (t.At(node).parent == NoNode ? 0 : t.At(node).parent);
+    n.selected = t.IsDir(node) ? NoNode : node;
+    Go(n);
+}
+
+// Selects a node keeping the current folder when it's inside it (WinDirStat-style linked selection).
+void SelectInExplore(u32 node)
+{
+    const ScanTree& t = *g.tree;
+    bool inside = false;
+    for (u32 p = t.At(node).parent; p != NoNode; p = t.At(p).parent) if (p == g.exploreRoot) { inside = true; break; }
+    Nav n = Current();
+    n.page = 1;
+    if (!inside) n.exploreRoot = t.At(node).parent == NoNode ? 0 : t.At(node).parent;
+    n.selected = node;
+    Go(n);
+}
+
+// Opens a file with its default app, or a folder in Explore.
+void OpenNode(u32 node)
+{
+    const ScanTree& t = *g.tree;
+    if (t.IsDir(node)) { ExploreTo(node); return; }
+    if (t.At(node).flags & NF_AGGREGATE) return;
+    const std::wstring path = t.Path(node);
+    if (reinterpret_cast<INT_PTR>(ShellExecuteW(g.hwnd, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
+        ShellExecuteW(g.hwnd, L"openas", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+void RefreshVolume()
+{
+    ULARGE_INTEGER avail, total, freeAll;
+    if (GetDiskFreeSpaceExW(g.volume.c_str(), &avail, &total, &freeAll)) { g.volFree = avail.QuadPart; g.volTotal = total.QuadPart; }
+}
+
+void Analyze()
+{
+    InsightsOptions io;
+    g.report = std::make_unique<InsightsReport>(sr::Analyze(*g.tree, io));
+    g.cleanup = std::make_unique<CleanupReport>(BuildCleanup(*g.tree, g.report.get()));
+    g.system = std::make_unique<SystemReport>(AnalyzeSystem(*g.tree));
+    g.kinds = std::make_unique<viz::KindModel>(viz::BuildKinds(*g.tree));
+    g.slack = EstimateSlack(*g.tree);
+    g.treemapRoot = NoNode;
+}
+
+void StartScan(const std::wstring& root)
+{
+    if (g.busy) return;
+    if (g.scanner) g.scanner->Cancel();
+    if (g.quick) g.quick->Cancel();
+    g.scanner.reset();
+    g.quick.reset();
+    g.tree.reset();
+    g.report.reset();
+    g.cleanup.reset();
+    g.system.reset();
+    g.kinds.reset();
+    g.root = root;
+    if (g.root.size() == 2 && g.root[1] == L':') g.root += L'\\';
+    g.volume = VolumeOf(g.root);
+    RefreshVolume();
+    g.exploreRoot = 0;
+    g.highlight = NoNode;
+    g.sunRoot = 0;
+    g.exploreScroll = 0;
+    g.expanded.clear();
+    g.back.clear();      // node numbers belong to the old scan
+    g.forward.clear();
     g.scanning = true;
+    if (g.page == PageReview) g.page = 3;
     g.scanner = std::make_unique<Scanner>();
     ScanOptions o;
     o.root = g.root;
+    o.threads = g.threads;
+    o.lowPriority = Low();
+    o.memoryBudget = Settings::Get().memoryBudgetMB ? Settings::Get().memoryBudgetMB * MiB : (Low() ? 256 * MiB : 0);
     g.scanner->Start(o, g.hwnd, WM_SCAN_DONE);
     g.scanStart = GetTickCount();
     if (g.root.size() <= 3)
@@ -927,31 +1475,524 @@ void StartScan()
         g.quick = std::make_unique<QuickWins>();
         g.quick->Start(g.volume);
     }
+    Settings::Get().lastScanPath = g.root;
+    Settings::Get().Save();
     SetTimer(g.hwnd, TimerProgress, 100, nullptr);
+    Invalidate();
 }
 
 void OnScanDone()
 {
     g.tree = g.scanner->TakeResult();
     KillTimer(g.hwnd, TimerProgress);
-    // Analysis runs here once; it's quick next to the scan.
-    InsightsOptions io;
-    g.report = std::make_unique<InsightsReport>(Analyze(*g.tree, io));
-    g.kinds = std::make_unique<viz::KindModel>(viz::BuildKinds(*g.tree));
+    if (g.tree->fileCount == 0 && g.tree->errorCount)
+        ShowToast(L"Couldn't read " + g.root + L". Check that it exists and you have access.", -1, true);
+    Analyze();
     g.vol = QueryVolume(g.volume);
-    g.slack = EstimateSlack(*g.tree);
-    // Largest file for the extents strip.
     u32 best = NoNode;
     for (u32 i = 1; i < g.tree->Count(); ++i)
     {
         const Node& n = g.tree->At(i);
-        if (!(n.flags & (NF_DIR | NF_AGGREGATE)) && (best == NoNode || n.size > g.tree->At(best).size)) best = i;
+        if (n.parent != NoNode && !(n.flags & (NF_DIR | NF_AGGREGATE)) && (best == NoNode || n.size > g.tree->At(best).size)) best = i;
     }
-    if (best != NoNode) g.bigFile = QueryFile(g.tree->Path(best), g.vol.bytesPerCluster);
+    g.bigFile = best != NoNode ? QueryFile(g.tree->Path(best), g.vol.bytesPerCluster) : FileInternals();
     g.scanning = false;
-    const int p = g.page;
+    const int p = g.page == PageReview ? 3 : g.page;
     g.page = -1;
-    SetPage(p);
+    ApplyNav({ p, 0, NoNode, 0, g.mapMode });
+}
+
+void ShowToast(const std::wstring& text, int undoId, bool error)
+{
+    g.toast = text;
+    g.toastUndo = undoId;
+    g.toastError = error;
+    SetTimer(g.hwnd, TimerToast, 12000, nullptr);
+    Invalidate();
+}
+
+void OpenReview(const std::wstring& title, std::vector<ReviewItem> items)
+{
+    g.reviewTitle = title;
+    for (ReviewItem& it : items)
+    {
+        it.locked = IsProtectedPath(g.tree->Path(it.node));
+        if (it.locked) it.checked = false;
+    }
+    g.review = std::move(items);
+    g.reviewScroll = 0;
+    if (g.page != PageReview) g.backPage = g.page;
+    SetPage(PageReview);
+}
+
+void OpenSectionReview(int s)
+{
+    const CleanSectionResult& sec = g.cleanup->sections[static_cast<size_t>(s)];
+    std::vector<ReviewItem> items;
+    for (const CleanGroup& grp : sec.groups)
+        for (const CleanItem& it : grp.items)
+        {
+            // The Recycle Bin gets its own "Empty" action; moving the bin folder itself makes no sense.
+            if (_wcsicmp(g.tree->Name(it.node).c_str(), L"$Recycle.Bin") == 0) continue;
+            items.push_back({ it.node, grp.name, it.safety, it.safety == Safety::Safe, false });
+        }
+    OpenReview(sec.title, std::move(items));
+}
+
+void RunAction(ActionKind kind)
+{
+    std::vector<std::wstring> paths;
+    std::vector<u32> nodes;
+    u64 bytes = 0;
+    for (const ReviewItem& it : g.review)
+        if (it.checked && !it.locked) { paths.push_back(g.tree->Path(it.node)); nodes.push_back(it.node); bytes += g.tree->At(it.node).size; }
+    if (paths.empty() || g.busy) return;
+    const std::wstring work = PickWorkVolume(g.volume, Settings::Get().rescue);
+    std::wstring what;
+    switch (kind)
+    {
+    case ActionKind::Quarantine: what = L"Move " + FormatCount(paths.size()) + L" items (" + FormatBytes(bytes) + L") to quarantine on " +
+        work.substr(0, 2) + L"?\n\nThey are copied, checked, then removed here. You can undo."; break;
+    case ActionKind::Recycle: what = L"Move " + FormatCount(paths.size()) + L" items (" + FormatBytes(bytes) +
+        L") to the Recycle Bin?\n\nYou can undo. Note: space is freed only when the Recycle Bin is emptied."; break;
+    case ActionKind::Compress: what = L"Compress " + FormatCount(paths.size()) + L" items (" + FormatBytes(bytes) +
+        L") with NTFS compression?\n\nFiles stay where they are and open normally. You can undo."; break;
+    case ActionKind::DeletePermanent: what = L"Permanently delete " + FormatCount(paths.size()) + L" items (" + FormatBytes(bytes) +
+        L")?\n\nThis cannot be undone."; break;
+    }
+    if (MessageBoxW(g.hwnd, what.c_str(), L"SpaceRescue", MB_OKCANCEL | (kind == ActionKind::DeletePermanent ? MB_ICONWARNING : MB_ICONQUESTION)) != IDOK)
+        return;
+    if (kind == ActionKind::DeletePermanent &&
+        MessageBoxW(g.hwnd, L"Are you sure? These files will be gone for good.", L"SpaceRescue", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+        return;
+    g.busy = true;
+    if (g.worker.joinable()) g.worker.join();
+    g.worker = std::thread([kind, paths, nodes, work] {
+        auto* res = new std::pair<ActionResult, std::vector<u32>>(ActionManager::Get().Apply(kind, paths, work), nodes);
+        PostMessageW(g.hwnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(res));
+    });
+    Invalidate();
+}
+
+void OnActionDone(std::pair<ActionResult, std::vector<u32>>* res)
+{
+    g.busy = false;
+    const ActionResult& r = res->first;
+    // Remove what was handled from the tree (compress keeps files in place).
+    if (r.kind != ActionKind::Compress)
+    {
+        for (size_t i = 0; i < res->second.size(); ++i)
+        {
+            const std::wstring path = g.tree->Path(res->second[i]);
+            if (std::find(r.done.begin(), r.done.end(), path) != r.done.end()) g.tree->Detach(res->second[i]);
+        }
+        g.review.erase(std::remove_if(g.review.begin(), g.review.end(), [&](const ReviewItem& it) {
+            return std::find(r.done.begin(), r.done.end(), g.tree->Path(it.node)) != r.done.end(); }), g.review.end());
+    }
+    RefreshVolume();
+    Analyze();
+    std::wstring text = r.summary.empty() ? Fmt(L"Done: %zu items.", r.done.size()) : r.summary;
+    if (!r.failed.empty()) text += Fmt(L" %zu couldn't be handled (first: %s).", r.failed.size(), r.failed[0].error.c_str());
+    ShowToast(text, ActionManager::Get().CanUndo(r.undoId) ? r.undoId : -1, r.done.empty() && !r.failed.empty());
+    delete res;
+}
+
+void RunUndo()
+{
+    if (g.toastUndo < 0 || g.busy) return;
+    const int id = g.toastUndo;
+    g.busy = true;
+    g.toast = L"Undoing\u2026";
+    g.toastUndo = -1;
+    if (g.worker.joinable()) g.worker.join();
+    g.worker = std::thread([id] {
+        auto* res = new ActionResult(ActionManager::Get().Undo(id));
+        PostMessageW(g.hwnd, WM_UNDO_DONE, 0, reinterpret_cast<LPARAM>(res));
+    });
+    Invalidate();
+}
+
+std::wstring PickPath(bool folder)
+{
+    std::wstring result;
+    IFileOpenDialog* dlg = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return result;
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | (folder ? FOS_PICKFOLDERS : 0));
+    dlg->SetTitle(folder ? L"Choose a folder to scan" : L"Choose a file to inspect");
+    if (SUCCEEDED(dlg->Show(g.hwnd)))
+    {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dlg->GetResult(&item)))
+        {
+            wchar_t* path = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) { result = path; CoTaskMemFree(path); }
+            item->Release();
+        }
+    }
+    dlg->Release();
+    return result;
+}
+
+void DriveMenu()
+{
+    HMENU menu = CreatePopupMenu();
+    const std::vector<DriveInfo> drives = EnumerateDrives(Settings::Get().rescue);
+    for (size_t i = 0; i < drives.size(); ++i)
+    {
+        const DriveInfo& d = drives[i];
+        AppendMenuW(menu, MF_STRING | (_wcsicmp(d.root.c_str(), g.root.c_str()) == 0 ? MF_CHECKED : 0), 1 + i,
+            (L"Scan " + d.root.substr(0, 2) + L"  " + d.label + L"   (" + FormatBytes(d.free) + L" free of " + FormatBytes(d.total) + L")" +
+             (d.low ? L"  \u2014 almost full" : L"")).c_str());
+    }
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, 100, L"Choose a folder\u2026");
+    AppendMenuW(menu, MF_STRING, 101, L"Rescan");
+    POINT pt;
+    GetCursorPos(&pt);
+    const UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g.hwnd, nullptr);
+    DestroyMenu(menu);
+    if (cmd >= 1 && cmd <= drives.size()) StartScan(drives[cmd - 1].root);
+    else if (cmd == 100) { const std::wstring p = PickPath(true); if (!p.empty()) StartScan(p); }
+    else if (cmd == 101) StartScan(g.root);
+}
+
+void WorkVolumeMenu()
+{
+    Settings& st = Settings::Get();
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING | (st.rescue.workVolumeOverride.empty() ? MF_CHECKED : 0), 1, L"Automatic (drive with most free space)");
+    const std::vector<DriveInfo> drives = EnumerateDrives(st.rescue);
+    for (size_t i = 0; i < drives.size(); ++i)
+        AppendMenuW(menu, MF_STRING | (_wcsicmp(drives[i].root.c_str(), st.rescue.workVolumeOverride.c_str()) == 0 ? MF_CHECKED : 0), 2 + i,
+            (drives[i].root.substr(0, 2) + L"  " + FormatBytes(drives[i].free) + L" free").c_str());
+    POINT pt;
+    GetCursorPos(&pt);
+    const UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g.hwnd, nullptr);
+    DestroyMenu(menu);
+    if (cmd == 1) st.rescue.workVolumeOverride.clear();
+    else if (cmd >= 2 && cmd - 2 < drives.size()) st.rescue.workVolumeOverride = drives[cmd - 2].root;
+    if (cmd) st.Save();
+    Invalidate();
+}
+
+void CopyText(const std::wstring& text, const wchar_t* toast)
+{
+    if (!OpenClipboard(g.hwnd)) return;
+    EmptyClipboard();
+    const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    if (HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes))
+    {
+        memcpy(GlobalLock(h), text.c_str(), bytes);
+        GlobalUnlock(h);
+        SetClipboardData(CF_UNICODETEXT, h);
+    }
+    CloseClipboard();
+    ShowToast(toast);
+}
+
+void OpenInFileExplorer(u32 node)
+{
+    const ScanTree& t = *g.tree;
+    const std::wstring path = t.Path(node);
+    if (t.IsDir(node)) ShellExecuteW(nullptr, L"explore", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    else ShellExecuteW(nullptr, L"open", L"explorer.exe", (L"/select,\"" + path + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+}
+
+// One context menu for every place a file or folder appears (list, treemap, sunburst, flame graph, cards, review).
+void NodeMenu(u32 node)
+{
+    if (!g.tree || node == NoNode || node >= g.tree->Count()) return;
+    const ScanTree& t = *g.tree;
+    const bool dir = t.IsDir(node);
+    const bool aggregate = (t.At(node).flags & NF_AGGREGATE) != 0;
+    const std::wstring path = aggregate ? t.Path(t.At(node).parent) : t.Path(node);
+    const bool locked = IsProtectedPath(path) || aggregate;
+    enum { Open = 1, OpenExplorer, ShowExplore, ShowMap, Prompt, Props, CopyPath, CopyName, Review, Recycle, Layout, ExpandAll };
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING | MF_DEFAULT, Open, dir ? L"Open\tDouble-click" : L"Open with default app\tDouble-click");
+    AppendMenuW(menu, MF_STRING, OpenExplorer, dir ? L"Open in File Explorer" : L"Show in File Explorer");
+    AppendMenuW(menu, MF_STRING, ShowExplore, L"Show in Explore");
+    AppendMenuW(menu, MF_STRING, ShowMap, L"Show in Map");
+    if (dir && g.page == 1) AppendMenuW(menu, MF_STRING, ExpandAll, g.expanded.size() > node && g.expanded[node] ? L"Collapse" : L"Expand");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, Prompt, L"Open command prompt here");
+    AppendMenuW(menu, MF_STRING, Props, L"Properties");
+    AppendMenuW(menu, MF_STRING, CopyPath, L"Copy path\tCtrl+C");
+    AppendMenuW(menu, MF_STRING, CopyName, L"Copy name");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | (locked ? MF_GRAYED : 0), Review, L"Review and remove\u2026\tDel");
+    AppendMenuW(menu, MF_STRING | (locked ? MF_GRAYED : 0), Recycle, L"Move to Recycle Bin\u2026");
+    if (!dir) AppendMenuW(menu, MF_STRING, Layout, L"How it sits on disk");
+    POINT pt;
+    GetCursorPos(&pt);
+    SetForegroundWindow(g.hwnd);
+    const UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g.hwnd, nullptr);
+    DestroyMenu(menu);
+    switch (cmd)
+    {
+    case Open: OpenNode(node); break;
+    case OpenExplorer: OpenInFileExplorer(node); break;
+    case ShowExplore: SelectInExplore(node); break;
+    case ShowMap:
+    {
+        Nav n = Current();
+        n.page = 2;
+        n.mapMode = 0;
+        n.sunRoot = dir ? node : (t.At(node).parent == NoNode ? 0 : t.At(node).parent);
+        n.selected = node;
+        Go(n);
+        break;
+    }
+    case ExpandAll:
+        if (g.expanded.size() > node) g.expanded[node] = !g.expanded[node];
+        Invalidate();
+        break;
+    case Prompt:
+    {
+        const std::wstring dirPath = dir ? path : t.Path(t.At(node).parent);
+        ShellExecuteW(nullptr, L"open", L"cmd.exe", nullptr, dirPath.c_str(), SW_SHOWNORMAL);
+        break;
+    }
+    case Props: SHObjectProperties(g.hwnd, SHOP_FILEPATH, path.c_str(), nullptr); break;
+    case CopyPath: CopyText(path, L"Path copied."); break;
+    case CopyName: CopyText(t.Name(node), L"Name copied."); break;
+    case Review: OpenReview(t.Name(node), { { node, L"Chosen by you", Safety::Review, true, false } }); break;
+    case Recycle:
+        OpenReview(t.Name(node), { { node, L"Chosen by you", Safety::Review, true, false } });
+        RunAction(ActionKind::Recycle);
+        break;
+    case Layout:
+        g.bigFile = QueryFile(path, g.vol.bytesPerCluster);
+        SetPage(5);
+        break;
+    }
+}
+
+// Typed or pasted path in the search box: jump there if it's in this scan, otherwise scan it.
+bool GoToPath(std::wstring path)
+{
+    while (!path.empty() && (path.back() == L'\\' || path.back() == L'"' || path.back() == L' ')) path.pop_back();
+    while (!path.empty() && (path.front() == L'"' || path.front() == L' ')) path.erase(path.begin());
+    if (path.size() == 2 && path[1] == L':') path += L'\\';
+    if (path.size() < 3 || path[1] != L':') return false;
+    const DWORD attr = GetFileAttributesW(LongPath(path).c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES) { ShowToast(L"That path doesn't exist: " + path, -1, true); return true; }
+    if (g.tree)
+        if (const u32 n = g.tree->Find(path); n != NoNode) { ExploreTo(n); return true; }
+    StartScan((attr & FILE_ATTRIBUTE_DIRECTORY) ? path : ParentPath(path));
+    return true;
+}
+
+void RunSystemTool(size_t i)
+{
+    const SystemItem& it = g.system->items[i];
+    const std::wstring& cmd = it.command;
+    std::wstring confirm = it.tool + L"\n\nSpaceRescue will run:\n" + cmd;
+    if (MessageBoxW(g.hwnd, confirm.c_str(), L"SpaceRescue", MB_OKCANCEL | MB_ICONINFORMATION) != IDOK) return;
+    const bool admin = cmd.find(L"(admin)") != std::wstring::npos;
+    std::wstring line = cmd.substr(0, cmd.find(L"  ("));
+    if (line.compare(0, 11, L"ms-settings") == 0) { ShellExecuteW(nullptr, L"open", line.c_str(), nullptr, nullptr, SW_SHOWNORMAL); return; }
+    const size_t space = line.find(L' ');
+    const std::wstring exe = line.substr(0, space), args = space == std::wstring::npos ? L"" : line.substr(space + 1);
+    if (admin)
+        ShellExecuteW(g.hwnd, L"runas", L"cmd.exe", (L"/k " + line).c_str(), nullptr, SW_SHOWNORMAL); // shows the result
+    else
+        ShellExecuteW(g.hwnd, L"open", exe.c_str(), args.empty() ? nullptr : args.c_str(), nullptr, SW_SHOWNORMAL);
+}
+
+void ToggleAlerts()
+{
+    const bool on = !IsStartWithWindows();
+    SetStartWithWindows(on);
+    if (on)
+    {
+        wchar_t exe[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        ShellExecuteW(nullptr, L"open", exe, L"/tray", nullptr, SW_HIDE);
+        ShowToast(L"Low-space alerts are on. Look for the SpaceRescue icon in the tray.");
+    }
+    else
+    {
+        if (HWND tray = FindWindowW(L"SpaceRescue.Tray", nullptr)) PostMessageW(tray, WM_CLOSE, 0, 0);
+        ShowToast(L"Low-space alerts are off.");
+    }
+}
+
+void ReserveAction()
+{
+    const ReserveStatus rs = QueryReserve();
+    if (rs.exists)
+    {
+        if (MessageBoxW(g.hwnd, (L"Release the reserve file?\n\nThis frees " + FormatBytes(rs.size) + L" on " + VolumeOf(rs.path).substr(0, 2) +
+            L" immediately.").c_str(), L"SpaceRescue", MB_OKCANCEL | MB_ICONQUESTION) != IDOK) return;
+        const DWORD e = ReleaseReserve();
+        ShowToast(e ? L"Couldn't release the reserve: " + ErrorText(e) : L"Reserve released: " + FormatBytes(rs.size) + L" freed.", -1, e != 0);
+    }
+    else
+    {
+        const u64 size = Settings::Get().rescue.reserveSize;
+        if (MessageBoxW(g.hwnd, (L"Create a " + FormatBytes(size) + L" reserve file on the system drive?\n\nIt sets space aside that you can release "
+            L"in one click when the drive is full.").c_str(), L"SpaceRescue", MB_OKCANCEL | MB_ICONQUESTION) != IDOK) return;
+        const DWORD e = CreateReserve(size);
+        ShowToast(e ? L"Couldn't create the reserve: " + ErrorText(e) : L"Reserve file created (" + FormatBytes(size) + L").", -1, e != 0);
+    }
+    RefreshVolume();
+}
+
+void Click(int hot)
+{
+    if (g.palette && hot != HotPaletteBox && (hot < HotPaletteItem || hot >= HotPaletteItem + 1000)) { g.palette = false; Invalidate(); return; }
+    if (hot >= HotPaletteItem && hot < HotPaletteItem + 1000) { RunPaletteItem(hot - HotPaletteItem); return; }
+    if (hot >= HotRail && hot < HotRail + 8) { SetPage(hot - HotRail); return; }
+    if (hot == HotDriveChip) { DriveMenu(); return; }
+    if (hot == HotSearch) { OpenPalette(); return; }
+    if (hot == HotToastClose) { g.toast.clear(); Invalidate(); return; }
+    if (hot == HotToastUndo) { RunUndo(); return; }
+    if (hot == HotBannerRelease) { ReserveAction(); return; }
+    if (hot == HotBack) { GoBack(); return; }
+    if (hot == HotForward) { GoForward(); return; }
+    if (g.scanning) return;
+    if (hot >= HotMapMode && hot < HotMapMode + 3) { Nav n = Current(); n.mapMode = hot - HotMapMode; Go(n); g.unfoldStart = GetTickCount(); return; }
+    if (hot == HotReviewAll) { SetPage(3); return; }
+    if (hot == HotExploreBtn) { Nav n = Current(); n.page = 1; n.exploreRoot = 0; n.selected = NoNode; Go(n); return; }
+    if (hot >= HotHog && hot < HotHog + 5) { SelectInExplore(g.hogNodes[static_cast<size_t>(hot - HotHog)]); return; }
+    if (hot == HotUp + 1000) { OpenInFileExplorer(g.exploreRoot); return; } // "Open in File Explorer"
+    if (hot >= HotChevron + 900 && hot < HotChevron + 1000) // breadcrumb part
+    {
+        const std::vector<u32> crumbs = Ancestors(g.exploreRoot);
+        const size_t i = static_cast<size_t>(hot - HotChevron - 900);
+        if (i < crumbs.size()) { Nav n = Current(); n.exploreRoot = crumbs[i]; n.selected = i + 1 < crumbs.size() ? crumbs[i + 1] : NoNode; Go(n); }
+        return;
+    }
+    if (hot >= HotChevron && hot < HotChevron + 900 && hot - HotChevron < static_cast<int>(g.rowNodes.size()))
+    {
+        const u32 n = g.rowNodes[static_cast<size_t>(hot - HotChevron)];
+        g.expanded[n] = !g.expanded[n];
+        g.highlight = n;
+        Invalidate();
+        return;
+    }
+    if (hot >= HotRow && hot < HotRow + 1000 && hot - HotRow < static_cast<int>(g.rowNodes.size()))
+    {
+        g.highlight = g.rowNodes[static_cast<size_t>(hot - HotRow)]; // single click selects; double-click opens
+        Invalidate();
+        return;
+    }
+    if (hot == HotTreemap)
+    {
+        const float s = g.canvas.Dpi() / 96.0f;
+        const u32 n = g.treemap.Hit(static_cast<int>((g.mouseX - g.treemapRect.left) * s), static_cast<int>((g.mouseY - g.treemapRect.top) * s));
+        if (n != NoNode && n != 0)
+        {
+            if (g.page == 1) { Reveal(n); Invalidate(); } // linked selection in the list
+            else SelectInExplore(n);
+        }
+        return;
+    }
+    if (hot >= HotFlame && hot - HotFlame < static_cast<int>(g.flameHits.size()))
+    {
+        g.highlight = g.flameHits[static_cast<size_t>(hot - HotFlame)].second;
+        Invalidate();
+        return;
+    }
+    if (hot == HotSunCard && g.page == 2)
+    {
+        Nav n = Current();
+        if (g.hoverSeg >= 0)
+        {
+            const viz::Segment& sg = g.sun.Segments()[static_cast<size_t>(g.hoverSeg)];
+            if (sg.node == NoNode) return;
+            if (g.tree->IsDir(sg.node)) n.sunRoot = sg.node;
+            n.selected = sg.node;
+        }
+        else if (g.sunRoot != g.tree->Root()) { n.selected = g.sunRoot; n.sunRoot = g.tree->At(g.sunRoot).parent; }
+        Go(n);
+        return;
+    }
+    if (hot >= HotCleanGroup && hot < HotCleanGroup + 800)
+    {
+        const int s = (hot - HotCleanGroup) / 200, gi = (hot - HotCleanGroup) % 200;
+        const CleanSectionResult& sec = g.cleanup->sections[static_cast<size_t>(s)];
+        if (gi < static_cast<int>(sec.groups.size()))
+        {
+            const CleanGroup& grp = sec.groups[static_cast<size_t>(gi)];
+            std::vector<ReviewItem> items;
+            for (const CleanItem& it : grp.items)
+                if (_wcsicmp(g.tree->Name(it.node).c_str(), L"$Recycle.Bin") != 0)
+                    items.push_back({ it.node, grp.name, it.safety, it.safety == Safety::Safe, false });
+            OpenReview(grp.name + L"  ·  " + FormatBytes(grp.bytes), std::move(items));
+        }
+        return;
+    }
+    if (hot >= HotCleanReview && hot < HotCleanReview + 4) { OpenSectionReview(hot - HotCleanReview); return; }
+    if (hot >= HotSysTool && hot < HotSysTool + 50) { RunSystemTool(static_cast<size_t>(hot - HotSysTool)); return; }
+    if (hot == HotAlerts) { ToggleAlerts(); return; }
+    if (hot >= HotReserveSize && hot < HotReserveSize + 4)
+    {
+        const u64 sizes[] = { 256 * MiB, 512 * MiB, 1 * GiB, 2 * GiB };
+        Settings::Get().rescue.reserveSize = sizes[hot - HotReserveSize];
+        Settings::Get().Save();
+        Invalidate();
+        return;
+    }
+    if (hot == HotReserveAction) { ReserveAction(); return; }
+    if (hot == HotWorkVolume) { WorkVolumeMenu(); return; }
+    if (hot == HotThreadsMinus || hot == HotThreadsPlus)
+    {
+        const int cur = g.threads ? g.threads : static_cast<int>(std::min(8u, std::max(1u, std::thread::hardware_concurrency())));
+        g.threads = std::clamp(cur + (hot == HotThreadsPlus ? 1 : -1), 1, 16);
+        Invalidate();
+        return;
+    }
+    if (hot >= HotTheme && hot < HotTheme + 3) { g.opt.theme = hot - HotTheme; ApplyTheme(); return; }
+    if (hot == HotBrowseFile)
+    {
+        const std::wstring p = PickPath(false);
+        if (!p.empty()) { g.bigFile = QueryFile(p, g.vol.bytesPerCluster); Invalidate(); }
+        return;
+    }
+    // Review page
+    if (hot == HotRevBack) { SetPage(g.backPage); return; }
+    if (hot == HotRevAll || hot == HotRevNone) { for (ReviewItem& it : g.review) it.checked = hot == HotRevAll && !it.locked; Invalidate(); return; }
+    if (hot >= HotRevItem && hot - HotRevItem < static_cast<int>(g.review.size()))
+    {
+        ReviewItem& it = g.review[static_cast<size_t>(hot - HotRevItem)];
+        if (!it.locked) it.checked = !it.checked;
+        Invalidate();
+        return;
+    }
+    if (hot == HotRevEmptyBin)
+    {
+        const u32 bin = g.tree->Find(JoinPath(g.volume, L"$Recycle.Bin"));
+        const u64 bytes = bin == NoNode ? 0 : g.tree->At(bin).size;
+        if (MessageBoxW(g.hwnd, (L"Empty the Recycle Bin on " + g.volume.substr(0, 2) + L"?\n\nThis frees about " + FormatBytes(bytes) +
+            L" and cannot be undone.").c_str(), L"SpaceRescue", MB_OKCANCEL | MB_ICONWARNING) != IDOK) return;
+        const HRESULT hr = SHEmptyRecycleBinW(g.hwnd, g.volume.c_str(), SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND);
+        if (SUCCEEDED(hr) || hr == E_UNEXPECTED) // E_UNEXPECTED = already empty
+        {
+            if (bin != NoNode) g.tree->Detach(bin);
+            RefreshVolume();
+            Analyze();
+            ShowToast(L"Recycle Bin emptied: about " + FormatBytes(bytes) + L" freed.");
+        }
+        else ShowToast(L"Couldn't empty the Recycle Bin: " + ErrorText(static_cast<DWORD>(hr)), -1, true);
+        return;
+    }
+    if (hot == HotRevRecycle) RunAction(ActionKind::Recycle);
+    else if (hot == HotRevQuarantine) RunAction(ActionKind::Quarantine);
+    else if (hot == HotRevCompress) RunAction(ActionKind::Compress);
+    else if (hot == HotRevDelete) RunAction(ActionKind::DeletePermanent);
+    else if (hot == HotRevOpen)
+    {
+        for (const ReviewItem& it : g.review)
+            if (it.checked)
+            {
+                ShellExecuteW(nullptr, L"open", L"explorer.exe", (L"/select,\"" + g.tree->Path(it.node) + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+                break;
+            }
+    }
 }
 
 int HotAt(float x, float y)
@@ -959,6 +2000,93 @@ int HotAt(float x, float y)
     for (auto it = g.hots.rbegin(); it != g.hots.rend(); ++it)
         if (gfx::Contains(it->r, x, y)) return it->id;
     return -1;
+}
+
+// The file/folder under the mouse for a hit id, wherever it is shown; NoNode if none.
+u32 NodeAt(int hot)
+{
+    if (!g.tree) return NoNode;
+    if (hot >= HotRow && hot < HotRow + 1000 && hot - HotRow < static_cast<int>(g.rowNodes.size())) return g.rowNodes[static_cast<size_t>(hot - HotRow)];
+    if (hot >= HotChevron && hot < HotChevron + 900 && hot - HotChevron < static_cast<int>(g.rowNodes.size())) return g.rowNodes[static_cast<size_t>(hot - HotChevron)];
+    if (hot >= HotHog && hot < HotHog + 5 && hot - HotHog < static_cast<int>(g.hogNodes.size())) return g.hogNodes[static_cast<size_t>(hot - HotHog)];
+    if (hot >= HotRevItem && hot - HotRevItem < static_cast<int>(g.review.size())) return g.review[static_cast<size_t>(hot - HotRevItem)].node;
+    if (hot >= HotFlame && hot - HotFlame < static_cast<int>(g.flameHits.size())) return g.flameHits[static_cast<size_t>(hot - HotFlame)].second;
+    if (hot == HotTreemap)
+    {
+        const float s = g.canvas.Dpi() / 96.0f;
+        return g.treemap.Hit(static_cast<int>((g.mouseX - g.treemapRect.left) * s), static_cast<int>((g.mouseY - g.treemapRect.top) * s));
+    }
+    if ((g.page == 0 || (g.page == 2 && g.mapMode == 0)) && g.hoverSeg >= 0)
+        return g.sun.Segments()[static_cast<size_t>(g.hoverSeg)].node;
+    return NoNode;
+}
+
+void SaveSnapshotBmp()
+{
+    wchar_t spec[MAX_PATH] = {};
+    GetEnvironmentVariableW(L"SR_SNAPSHOT", spec, MAX_PATH);
+    std::wstring file = spec;
+    file = file.substr(0, file.find(L';'));
+    RECT rc;
+    GetClientRect(g.hwnd, &rc);
+    HDC screen = GetDC(g.hwnd);
+    HDC mem = CreateCompatibleDC(screen);
+    BITMAPINFO bi = {};
+    bi.bmiHeader = { sizeof(BITMAPINFOHEADER), rc.right, -rc.bottom, 1, 32, BI_RGB };
+    void* bits = nullptr;
+    HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HGDIOBJ old = SelectObject(mem, dib);
+    Paint(mem);
+    GdiFlush();
+    BITMAPFILEHEADER fh = { 0x4D42, 0, 0, 0, sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) };
+    const DWORD bytes = static_cast<DWORD>(rc.right) * rc.bottom * 4;
+    fh.bfSize = fh.bfOffBits + bytes;
+    if (FILE* f = _wfopen(file.c_str(), L"wb"))
+    {
+        fwrite(&fh, sizeof fh, 1, f);
+        fwrite(&bi.bmiHeader, sizeof bi.bmiHeader, 1, f);
+        fwrite(bits, bytes, 1, f);
+        fclose(f);
+    }
+    SelectObject(mem, old);
+    DeleteObject(dib);
+    DeleteDC(mem);
+    ReleaseDC(g.hwnd, screen);
+}
+
+void UpdateHover(HWND hwnd, LPARAM lp)
+{
+    const float s = 96.0f / static_cast<float>(GetDpiForWindow(hwnd));
+    g.mouseX = static_cast<float>(static_cast<short>(LOWORD(lp))) * s;
+    g.mouseY = static_cast<float>(static_cast<short>(HIWORD(lp))) * s;
+    const int hot = HotAt(g.mouseX, g.mouseY);
+    g.hoverHot = hot;
+    g.hoverRail = hot >= HotRail && hot < HotRail + 8 ? hot - HotRail : -1;
+    g.hoverSeg = -1;
+    g.hoverTile = NoNode;
+    if (!g.scanning && !g.palette && g.tree)
+    {
+        if (g.page == 0 || (g.page == 2 && g.mapMode == 0))
+        {
+            const float banner = Low() ? 64.0f : 0.0f;
+            const D2D1_RECT_F area = { Rail + Margin, Top + 16 + banner, g.canvas.Width() - Margin, g.canvas.Height() - 24 };
+            SunGeom geo;
+            if (g.page == 0)
+            {
+                const float heroW = std::min((area.right - area.left) * 0.52f, area.bottom - area.top);
+                const float outer = std::min(heroW - 48, area.bottom - area.top - 64 - 40) / 2;
+                geo = { area.left + heroW / 2, area.top + 20 + outer, outer * 0.40f, outer };
+            }
+            else geo = MapGeometry({ area.left, area.top + 50, area.right, area.bottom });
+            g.hoverSeg = g.sun.Hit(g.mouseX, g.mouseY, geo.cx, geo.cy, geo.inner, geo.outer);
+        }
+        if (hot == HotTreemap && g.page == 2)
+        {
+            const float sc = g.canvas.Dpi() / 96.0f;
+            g.hoverTile = g.treemap.Hit(static_cast<int>((g.mouseX - g.treemapRect.left) * sc), static_cast<int>((g.mouseY - g.treemapRect.top) * sc));
+        }
+    }
+    Invalidate();
 }
 
 LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -978,7 +2106,7 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_SIZE:
         g.canvas.Resize(LOWORD(lp), HIWORD(lp));
-        InvalidateRect(hwnd, nullptr, FALSE);
+        Invalidate();
         return 0;
     case WM_DPICHANGED:
     {
@@ -987,114 +2115,203 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g.treemapW = 0;
         return 0;
     }
+    case WM_SETTINGCHANGE:
+        if (g.opt.theme == 0) ApplyTheme(); // follow Windows light/dark switches live
+        return 0;
     case WM_TIMER:
-        if (wp == 99) // SR_SNAPSHOT: render this frame into a BMP (docs screenshots without screen capture)
-        {
-            KillTimer(hwnd, 99);
-            wchar_t spec[MAX_PATH] = {};
-            GetEnvironmentVariableW(L"SR_SNAPSHOT", spec, MAX_PATH);
-            std::wstring file = spec;
-            file = file.substr(0, file.find(L';'));
-            RECT rc;
-            GetClientRect(hwnd, &rc);
-            HDC screen = GetDC(hwnd);
-            HDC mem = CreateCompatibleDC(screen);
-            BITMAPINFO bi = {};
-            bi.bmiHeader = { sizeof(BITMAPINFOHEADER), rc.right, -rc.bottom, 1, 32, BI_RGB };
-            void* bits = nullptr;
-            HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-            HGDIOBJ old = SelectObject(mem, dib);
-            Paint(mem);
-            GdiFlush();
-            BITMAPFILEHEADER fh = { 0x4D42, 0, 0, 0, sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) };
-            const DWORD bytes = static_cast<DWORD>(rc.right) * rc.bottom * 4;
-            fh.bfSize = fh.bfOffBits + bytes;
-            if (FILE* f = _wfopen(file.c_str(), L"wb"))
-            {
-                fwrite(&fh, sizeof fh, 1, f);
-                fwrite(&bi.bmiHeader, sizeof bi.bmiHeader, 1, f);
-                fwrite(bits, bytes, 1, f);
-                fclose(f);
-            }
-            SelectObject(mem, old);
-            DeleteObject(dib);
-            DeleteDC(mem);
-            ReleaseDC(hwnd, screen);
-            return 0;
-        }
-        InvalidateRect(hwnd, nullptr, FALSE);
+        if (wp == TimerSnapshot) { KillTimer(hwnd, TimerSnapshot); SaveSnapshotBmp(); return 0; }
+        if (wp == TimerToast) { KillTimer(hwnd, TimerToast); g.toast.clear(); }
+        Invalidate();
         return 0;
     case WM_SCAN_DONE:
         OnScanDone();
         return 0;
+    case WM_ACTION_DONE:
+        if (g.worker.joinable()) g.worker.join();
+        OnActionDone(reinterpret_cast<std::pair<ActionResult, std::vector<u32>>*>(lp));
+        return 0;
+    case WM_UNDO_DONE:
+    {
+        if (g.worker.joinable()) g.worker.join();
+        g.busy = false;
+        auto* r = reinterpret_cast<ActionResult*>(lp);
+        const std::wstring text = r->summary.empty() ? std::wstring(L"Undone.") : r->summary;
+        delete r;
+        ShowToast(text + L" Rescanning to show the restored files\u2026");
+        StartScan(g.root);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == HotDriveChip && lp == 1) { const std::wstring p = PickPath(true); if (!p.empty()) StartScan(p); }
+        return 0;
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT)
+        {
+            const int hot = g.hoverHot;
+            const bool clickable = hot >= HotRail && hot != HotPaletteBox;
+            SetCursor(LoadCursorW(nullptr, g.busy ? IDC_APPSTARTING : clickable ? IDC_HAND : IDC_ARROW));
+            return TRUE;
+        }
+        break;
     case WM_MOUSEMOVE:
     {
-        const float s = 96.0f / static_cast<float>(GetDpiForWindow(hwnd));
-        g.mouseX = static_cast<float>(static_cast<short>(LOWORD(lp))) * s;
-        g.mouseY = static_cast<float>(static_cast<short>(HIWORD(lp))) * s;
-        const int hot = HotAt(g.mouseX, g.mouseY);
-        g.hoverRail = hot >= 100 && hot < 108 ? hot - 100 : -1;
-        if (!g.scanning && (g.page == 0 || (g.page == 2 && g.mapMode == 0)) && g.canvas.Width() > 0)
-        {
-            // Recompute geometry the same way the page draws it.
-            const D2D1_RECT_F area = { Rail + Margin, Top + 16, g.canvas.Width() - Margin, g.canvas.Height() - 24 };
-            float cx, cy, inner, outer;
-            if (g.page == 0)
-            {
-                const float heroW = std::min((area.right - area.left) * 0.52f, area.bottom - area.top);
-                outer = std::min(heroW - 48, area.bottom - area.top - 64 - 40) / 2;
-                cx = area.left + heroW / 2; cy = area.top + 20 + outer; inner = outer * 0.40f;
-            }
-            else
-            {
-                const D2D1_RECT_F vr = { area.left, area.top + 50, area.right, area.bottom };
-                outer = std::min(vr.right - vr.left, vr.bottom - vr.top) / 2 - 28;
-                cx = (vr.left + vr.right) / 2; cy = (vr.top + vr.bottom) / 2; inner = outer * 0.32f;
-            }
-            g.hoverSeg = g.sun.Hit(g.mouseX, g.mouseY, cx, cy, inner, outer);
-        }
-        if (!g.scanning && g.page == 2 && g.mapMode == 1)
-        {
-            const float px = (g.mouseX - (Rail + Margin + 10)) * GetDpiForWindow(hwnd) / 96.0f;
-            const float py = (g.mouseY - (Top + 16 + 60)) * GetDpiForWindow(hwnd) / 96.0f;
-            g.hoverTile = g.treemap.Hit(static_cast<int>(px), static_cast<int>(py));
-        }
-        InvalidateRect(hwnd, nullptr, FALSE);
+        UpdateHover(hwnd, lp);
         TRACKMOUSEEVENT tme = { sizeof tme, TME_LEAVE, hwnd, 0 };
         TrackMouseEvent(&tme);
         return 0;
     }
     case WM_MOUSELEAVE:
-        g.hoverRail = g.hoverSeg = -1;
+        g.hoverRail = g.hoverSeg = g.hoverHot = -1;
         g.hoverTile = NoNode;
-        InvalidateRect(hwnd, nullptr, FALSE);
+        Invalidate();
         return 0;
-    case WM_LBUTTONDOWN:
+    case WM_MOUSEWHEEL:
     {
+        const int notches = GET_WHEEL_DELTA_WPARAM(wp) / 120;
+        if (g.palette)
+            g.paletteSel = std::clamp(g.paletteSel - notches, 0, std::max(0, static_cast<int>(g.items.size()) - 1));
+        else if (g.page == PageReview) g.reviewScroll -= static_cast<float>(notches) * 80.0f;
+        else if (g.page == 1) g.exploreScroll = std::max(0, g.exploreScroll - notches * 3);
+        Invalidate();
+        return 0;
+    }
+    case WM_LBUTTONDOWN:
+        SetFocus(hwnd);
+        UpdateHover(hwnd, lp);
+        Click(HotAt(g.mouseX, g.mouseY));
+        return 0;
+    case WM_LBUTTONDBLCLK:
+    {
+        // Double-click opens: folders in Explore, files with their default app.
+        UpdateHover(hwnd, lp);
+        if (g.scanning || g.palette) return 0;
+        const u32 n = NodeAt(HotAt(g.mouseX, g.mouseY));
+        if (n != NoNode && n != 0) OpenNode(n);
+        else Click(HotAt(g.mouseX, g.mouseY));
+        return 0;
+    }
+    case WM_RBUTTONUP:
+    {
+        UpdateHover(hwnd, lp);
+        if (g.scanning || g.palette) return 0;
         const int hot = HotAt(g.mouseX, g.mouseY);
-        if (hot >= 100 && hot < 108) SetPage(hot - 100);
-        else if (hot >= 200 && hot < 203) { g.mapMode = hot - 200; g.unfoldStart = GetTickCount(); InvalidateRect(hwnd, nullptr, FALSE); }
-        else if (hot == 400) SetPage(3);
-        else if (g.page == 2 && g.mapMode == 0 && g.tree)
+        const u32 n = NodeAt(hot);
+        if (n != NoNode)
         {
-            if (g.hoverSeg >= 0)
+            if (g.page == 1 && hot >= HotRow && hot < HotRow + 1000) { g.highlight = n; Invalidate(); }
+            NodeMenu(n);
+        }
+        else if (g.page == 1 && g.exploreRoot != NoNode && hot == -1) NodeMenu(g.exploreRoot);
+        return 0;
+    }
+    case WM_XBUTTONUP: // mouse side buttons
+        if (GET_XBUTTON_WPARAM(wp) == XBUTTON1) GoBack();
+        else GoForward();
+        return TRUE;
+    case WM_SYSKEYDOWN:
+        if (wp == VK_LEFT) { GoBack(); return 0; }
+        if (wp == VK_RIGHT) { GoForward(); return 0; }
+        break;
+    case WM_APPCOMMAND:
+        if (GET_APPCOMMAND_LPARAM(lp) == APPCOMMAND_BROWSER_BACKWARD) { GoBack(); return TRUE; }
+        if (GET_APPCOMMAND_LPARAM(lp) == APPCOMMAND_BROWSER_FORWARD) { GoForward(); return TRUE; }
+        break;
+    case WM_CONTEXTMENU:
+        if (lp == -1 && !g.scanning && g.highlight != NoNode) NodeMenu(g.highlight); // keyboard: menu key / Shift+F10
+        return 0;
+    case WM_CHAR:
+        if (!g.palette)
+        {
+            if (wp == L'/') OpenPalette();
+            return 0;
+        }
+        if (wp == 8) { if (!g.query.empty()) g.query.pop_back(); }
+        else if (wp == 22 && OpenClipboard(hwnd)) // Ctrl+V: paste a path
+        {
+            if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) { g.query += static_cast<const wchar_t*>(GlobalLock(h)); GlobalUnlock(h); }
+            CloseClipboard();
+        }
+        else if (wp >= 32) g.query += static_cast<wchar_t>(wp);
+        else return 0;
+        BuildPalette();
+        Invalidate();
+        return 0;
+    case WM_KEYDOWN:
+    {
+        const bool ctrl = GetKeyState(VK_CONTROL) < 0;
+        if (g.palette)
+        {
+            if (wp == VK_ESCAPE) g.palette = false;
+            else if (wp == VK_DOWN) g.paletteSel = std::min(g.paletteSel + 1, std::max(0, static_cast<int>(g.items.size()) - 1));
+            else if (wp == VK_UP) g.paletteSel = std::max(g.paletteSel - 1, 0);
+            else if (wp == VK_RETURN) { RunPaletteItem(g.paletteSel); return 0; }
+            Invalidate();
+            return 0;
+        }
+        if (ctrl && (wp == 'K' || wp == 'F' || wp == 'L')) { OpenPalette(); return 0; }
+        if (ctrl && wp >= '1' && wp <= '8') { SetPage(static_cast<int>(wp - '1')); return 0; }
+        if (ctrl && wp == VK_TAB) { SetPage(((g.page == PageReview ? 3 : g.page) + (GetKeyState(VK_SHIFT) < 0 ? 7 : 1)) % 8); return 0; }
+        if (wp == VK_F5) { StartScan(g.root); return 0; }
+        if (wp == VK_BROWSER_BACK) { GoBack(); return 0; }
+        if (wp == VK_BROWSER_FORWARD) { GoForward(); return 0; }
+        if (wp == VK_ESCAPE && g.toast.size()) { g.toast.clear(); Invalidate(); return 0; }
+        if (g.scanning || !g.tree) return 0;
+        if (wp == VK_ESCAPE && g.page == PageReview) { GoBack(); return 0; }
+        if (wp == VK_BACK) { GoBack(); return 0; }
+        // Selection actions (any page with a selected item).
+        if (g.highlight != NoNode)
+        {
+            if (ctrl && wp == 'C') { CopyText(g.tree->Path(g.highlight), L"Path copied."); return 0; }
+            if (wp == VK_DELETE) { OpenReview(g.tree->Name(g.highlight), { { g.highlight, L"Chosen by you", Safety::Review, true, false } }); return 0; }
+            if (wp == VK_RETURN) { OpenNode(g.highlight); return 0; }
+        }
+        // Explore keyboard navigation (WinDirStat-style tree).
+        if (g.page == 1 && !g.flat.empty())
+        {
+            int i = g.highlight == NoNode ? -1 : FlatIndexOf(g.highlight);
+            const ScanTree& t = *g.tree;
+            switch (wp)
             {
-                const viz::Segment& s = g.sun.Segments()[static_cast<size_t>(g.hoverSeg)];
-                if (s.node != NoNode && g.tree->IsDir(s.node)) g.sunRoot = s.node;
+            case VK_DOWN: i = std::min(i + 1, static_cast<int>(g.flat.size()) - 1); break;
+            case VK_UP: i = std::max(i - 1, 0); break;
+            case VK_NEXT: i = std::min(i + g.exploreRows, static_cast<int>(g.flat.size()) - 1); break;
+            case VK_PRIOR: i = std::max(i - g.exploreRows, 0); break;
+            case VK_HOME: i = 0; break;
+            case VK_END: i = static_cast<int>(g.flat.size()) - 1; break;
+            case VK_RIGHT:
+                if (i >= 0)
+                {
+                    const u32 n = g.flat[static_cast<size_t>(i)].first;
+                    if (t.IsDir(n) && !g.expanded[n]) { g.expanded[n] = 1; FlattenExplore(); }
+                    else if (i + 1 < static_cast<int>(g.flat.size()) && g.flat[static_cast<size_t>(i) + 1].second > g.flat[static_cast<size_t>(i)].second) ++i;
+                }
+                break;
+            case VK_LEFT:
+                if (i >= 0)
+                {
+                    const u32 n = g.flat[static_cast<size_t>(i)].first;
+                    if (t.IsDir(n) && g.expanded[n]) { g.expanded[n] = 0; FlattenExplore(); }
+                    else if (t.At(n).parent != g.exploreRoot) i = FlatIndexOf(t.At(n).parent);
+                    else if (g.exploreRoot != 0) { Nav nv = Current(); nv.exploreRoot = t.At(g.exploreRoot).parent; nv.selected = g.exploreRoot; Go(nv); return 0; }
+                }
+                break;
+            default: return 0;
             }
-            else if (g.sunRoot != g.tree->Root()) g.sunRoot = g.tree->At(g.sunRoot).parent; // centre click: up
-            g.sun.Build(*g.tree, g.sunRoot, 0, 5);
-            g.unfoldStart = GetTickCount();
-            g.hoverSeg = -1;
-            InvalidateRect(hwnd, nullptr, FALSE);
+            if (i < 0) i = 0;
+            g.highlight = g.flat[static_cast<size_t>(i)].first;
+            if (i < g.exploreScroll) g.exploreScroll = i;
+            else if (i >= g.exploreScroll + g.exploreRows) g.exploreScroll = i - g.exploreRows + 1;
+            Invalidate();
         }
         return 0;
     }
-    case WM_KEYDOWN:
-        if (GetKeyState(VK_CONTROL) < 0 && wp >= '1' && wp <= '8') SetPage(static_cast<int>(wp - '1'));
-        else if (GetKeyState(VK_CONTROL) < 0 && wp == VK_TAB) SetPage((g.page + (GetKeyState(VK_SHIFT) < 0 ? 7 : 1)) % 8);
+    case WM_CLOSE:
+        if (g.busy && MessageBoxW(hwnd, L"An action is still running. Close anyway?", L"SpaceRescue", MB_YESNO | MB_ICONWARNING) != IDYES) return 0;
+        DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
+        if (g.scanner) g.scanner->Cancel();
+        if (g.quick) g.quick->Cancel();
         PostQuitMessage(0);
         return 0;
     }
@@ -1104,19 +2321,18 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 bool ParsePreviewArgs(const int argc, wchar_t** argv, PreviewOptions* options)
 {
-    bool preview = false;
+    bool classic = false;
     for (int i = 1; i < argc; ++i)
     {
         const wchar_t* a = argv[i];
         const bool sw = a[0] == L'/' || a[0] == L'-';
-        if (sw && _wcsicmp(a + 1, L"preview") == 0) preview = true;
+        if (sw && _wcsicmp(a + 1, L"classic") == 0) classic = true;
         else if (sw && _wcsicmp(a + 1, L"light") == 0) options->theme = 1;
         else if (sw && _wcsicmp(a + 1, L"dark") == 0) options->theme = 2;
         else if (sw && _wcsicmp(a + 1, L"page") == 0 && i + 1 < argc) options->page = _wtoi(argv[++i]);
         else if (!sw)
         {
-            // "C:\" on a command line arrives as C:" (the backslash escapes the quote).
-            // "C:\" /dark even arrives as one argument: C:" /dark. Cut at the stray quote.
+            // "C:\" /dark can arrive as one argument: C:" /dark (the backslash escapes the quote).
             std::wstring p = a;
             if (const size_t q = p.find(L'"'); q != std::wstring::npos)
             {
@@ -1129,44 +2345,36 @@ bool ParsePreviewArgs(const int argc, wchar_t** argv, PreviewOptions* options)
             options->path = p;
         }
     }
-    return preview;
+    return !classic; // the new interface is the default; /classic opens the old one
 }
 
 int RunPreview(const HINSTANCE instance, const int show, const PreviewOptions& options)
 {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     g.opt = options;
-    g.pal = options.theme == 1 ? &gfx::Light() : options.theme == 2 ? &gfx::Dark() :
-        (gfx::SystemPrefersDark() ? &gfx::Dark() : &gfx::Light());
     g.page = std::clamp(options.page, 0, 7);
-    g.root = options.path.empty() ? VolumeOf(KnownFolder(CSIDL_WINDOWS)) : options.path;
-    if (g.root.size() == 2 && g.root[1] == L':') g.root += L'\\';
-    g.volume = VolumeOf(g.root);
-    ULARGE_INTEGER avail, total, freeAll;
-    if (GetDiskFreeSpaceExW(g.volume.c_str(), &avail, &total, &freeAll)) { g.volFree = avail.QuadPart; g.volTotal = total.QuadPart; }
+    std::wstring root = options.path;
+    if (root.empty()) root = VolumeOf(KnownFolder(CSIDL_WINDOWS));
 
     WNDCLASSEXW wc = { sizeof wc };
+    wc.style = CS_DBLCLKS;
     wc.lpfnWndProc = Proc;
     wc.hInstance = instance;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1));
-    wc.lpszClassName = L"SpaceRescue.Preview";
+    wc.lpszClassName = L"SpaceRescue.Main";
     RegisterClassExW(&wc);
     g.hwnd = CreateWindowExW(0, wc.lpszClassName, L"SpaceRescue", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1500, 980,
         nullptr, nullptr, instance, nullptr);
-    // Title bar blends into the app: dark mode caption + caption colour = base, Mica backdrop.
-    const BOOL dark = P().dark ? TRUE : FALSE;
-    DwmSetWindowAttribute(g.hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof dark);
-    const COLORREF caption = RGB(static_cast<int>(P().base.r * 255), static_cast<int>(P().base.g * 255), static_cast<int>(P().base.b * 255));
-    DwmSetWindowAttribute(g.hwnd, 35 /* DWMWA_CAPTION_COLOR */, &caption, sizeof caption);
+    ApplyTheme();
     const int backdrop = 2; // DWMSBT_MAINWINDOW (Mica)
     DwmSetWindowAttribute(g.hwnd, 38 /* DWMWA_SYSTEMBACKDROP_TYPE */, &backdrop, sizeof backdrop);
     ShowWindow(g.hwnd, show);
-    StartScan();
+    StartScan(root);
     if (wchar_t spec[MAX_PATH]; GetEnvironmentVariableW(L"SR_SNAPSHOT", spec, MAX_PATH))
     {
         const wchar_t* ms = wcschr(spec, L';');
-        SetTimer(g.hwnd, 99, ms ? static_cast<UINT>(_wtoi(ms + 1)) : 3000, nullptr);
+        SetTimer(g.hwnd, TimerSnapshot, ms ? static_cast<UINT>(_wtoi(ms + 1)) : 3000, nullptr);
     }
 
     MSG msg;
@@ -1175,6 +2383,9 @@ int RunPreview(const HINSTANCE instance, const int show, const PreviewOptions& o
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    if (g.worker.joinable()) g.worker.join();
+    g.scanner.reset();
+    g.quick.reset();
     g.canvas.Discard();
     return 0;
 }
